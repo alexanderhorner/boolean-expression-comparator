@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Boolean Expression Comparator</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+      background-color: #f0f2f5;
+    }
+    h1 {
+      color: #333;
+    }
+    .input-group {
+      margin-bottom: 10px;
+    }
+    input[type="text"] {
+      width: 300px;
+      padding: 5px;
+      margin-right: 10px;
+    }
+    button {
+      padding: 5px 10px;
+    }
+    table {
+      border-collapse: collapse;
+      margin-top: 20px;
+    }
+    table, th, td {
+      border: 1px solid #ccc;
+    }
+    th, td {
+      padding: 8px 12px;
+      text-align: center;
+    }
+    .match {
+      background-color: #d4edda;
+    }
+    .diff {
+      background-color: #f8d7da;
+    }
+  </style>
+</head>
+<body>
+  <h1>Boolean Expression Comparator</h1>
+  <div class="input-group">
+    <label for="expr1">Expression 1:</label>
+    <input type="text" id="expr1" value="(A+B')'">
+  </div>
+  <div class="input-group">
+    <label for="expr2">Expression 2:</label>
+    <input type="text" id="expr2" value="A'*B">
+  </div>
+  <button onclick="compareExpressions()">Compare</button>
+
+  <div id="table-container"></div>
+
+  <script>
+    // Utility to extract unique variables from an expression
+    function extractVariables(expr) {
+      const vars = new Set();
+      for (let char of expr) {
+        if (/[A-Za-z]/.test(char)) {
+          vars.add(char);
+        }
+      }
+      return Array.from(vars).sort();
+    }
+
+    // Normalize expression: handle postfix apostrophe for NOT and convert operators to JS syntax
+    function normalizeExpression(expr) {
+      let e = expr.replace(/\s+/g, '');
+      // Handle negation for parenthesized groups first
+      let pattern = /\([^()]+\)'/g;
+      // Replace (group)' with !(group)
+      while (pattern.test(e)) {
+        e = e.replace(pattern, (match) => {
+          // match is something like "(A+B)'"
+          const inner = match.slice(1, -2); // remove outer parentheses and trailing '
+          return '!(' + inner + ')';
+        });
+      }
+      // Handle negation for single variables
+      e = e.replace(/([A-Za-z])'/g, '!$1');
+      // Replace XOR with != for boolean logic
+      e = e.replace(/\^/g, '!=');
+      // Replace OR with ||
+      e = e.replace(/\+/g, '||');
+      // Replace explicit AND '*' with &&
+      e = e.replace(/\*/g, '&&');
+      // Insert implicit AND for adjacency: e.g., AB -> A&&B, A(B+C) -> A&&(B+C), (A+B)C -> (A+B)&&C
+      e = e.replace(/([A-Za-z\)\!])(?=\()/g, '$1&&');
+      e = e.replace(/([A-Za-z\)\!])(?=[A-Za-z])/g, '$1&&');
+      return e;
+    }
+
+    // Evaluate boolean expression given a variable assignment
+    function evaluate(expr, assignment) {
+      let jsExpr = expr;
+      // Replace variables with their boolean values (true/false)
+      for (const [variable, value] of Object.entries(assignment)) {
+        const regex = new RegExp(variable, 'g');
+        jsExpr = jsExpr.replace(regex, value);
+      }
+      try {
+        return eval(jsExpr);
+      } catch (err) {
+        console.error('Evaluation error for', jsExpr, err);
+        return false;
+      }
+    }
+
+    // Generate truth table rows
+    function generateTruthTable(vars) {
+      const rows = [];
+      const total = 1 << vars.length;
+      for (let i = 0; i < total; i++) {
+        const assignment = {};
+        for (let bit = 0; bit < vars.length; bit++) {
+          assignment[vars[bit]] = (i >> (vars.length - bit - 1)) & 1 ? true : false;
+        }
+        rows.push(assignment);
+      }
+      return rows;
+    }
+
+    function compareExpressions() {
+      const expr1Input = document.getElementById('expr1').value;
+      const expr2Input = document.getElementById('expr2').value;
+      // Extract variables from both expressions
+      const vars = extractVariables(expr1Input + expr2Input);
+      // Normalize expressions for JS evaluation
+      const expr1 = normalizeExpression(expr1Input);
+      const expr2 = normalizeExpression(expr2Input);
+      // Generate truth table rows
+      const rows = generateTruthTable(vars);
+      // Build table
+      let html = '<table><tr>';
+      vars.forEach(v => {
+        html += '<th>' + v + '</th>';
+      });
+      html += '<th>' + expr1Input + '</th><th>' + expr2Input + '</th></tr>';
+      rows.forEach(assignment => {
+        const val1 = evaluate(expr1, assignment);
+        const val2 = evaluate(expr2, assignment);
+        const cls = val1 === val2 ? 'match' : 'diff';
+        html += '<tr class="' + cls + '">';
+        vars.forEach(v => {
+          html += '<td>' + (assignment[v] ? 1 : 0) + '</td>';
+        });
+        html += '<td>' + (val1 ? 1 : 0) + '</td>';
+        html += '<td>' + (val2 ? 1 : 0) + '</td>';
+        html += '</tr>';
+      });
+      html += '</table>';
+      document.getElementById('table-container').innerHTML = html;
+    }
+  </script>
+</body>
+</html>
