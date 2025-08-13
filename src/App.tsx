@@ -219,8 +219,8 @@ export default function App() {
   const display = useMemo(() => (onlyDiff ? table.filter((r) => !r.same) : table), [table, onlyDiff]);
 
   return (
-    <div className="min-h-screen w-full bg-neutral-50 text-neutral-900 p-6">
-      <div className="max-w-5xl mx-auto">
+    <div className="min-h-screen w-full bg-neutral-50 text-neutral-900 p-6 flex flex-col">
+      <div className="max-w-5xl mx-auto flex-1">
         <header className="mb-6">
           <h1 className="text-2xl font-semibold tracking-tight">Boolean Expression Comparator</h1>
           <p className="text-sm text-neutral-600 mt-1">
@@ -321,6 +321,9 @@ export default function App() {
           </div>
         </details>
       </div>
+      <footer className="text-[0.6rem] text-neutral-500 text-center mt-4">
+        © 2025 Alexander Horner
+      </footer>
     </div>
   );
 }
