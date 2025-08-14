@@ -1,5 +1,7 @@
 import React, { useState, useMemo } from 'react';
 
+declare const katex: any;
+
 type Op = 'AND' | 'OR' | 'XOR' | 'NOT';
 
 type Token =
@@ -138,6 +140,74 @@ function toRPN(tokens: Token[]): Token[] {
   return output;
 }
 
+type ASTNode =
+  | { type: 'VAR'; name: string }
+  | { type: 'CONST'; value: boolean }
+  | { type: 'NOT'; expr: ASTNode }
+  | { type: 'AND' | 'OR' | 'XOR'; left: ASTNode; right: ASTNode };
+
+function rpnToAST(rpn: Token[]): ASTNode {
+  const st: ASTNode[] = [];
+  for (const t of rpn) {
+    if (t.type === 'VAR') st.push({ type: 'VAR', name: t.name });
+    else if (t.type === 'CONST') st.push({ type: 'CONST', value: t.value });
+    else if (t.type === 'OP') {
+      if (t.op === 'NOT') {
+        const a = st.pop();
+        if (!a) throw new Error('NOT missing operand');
+        st.push({ type: 'NOT', expr: a });
+      } else {
+        const b = st.pop();
+        const a = st.pop();
+        if (!a || !b) throw new Error(`${t.op} missing operand`);
+        st.push({ type: t.op, left: a, right: b });
+      }
+    }
+  }
+  if (st.length !== 1) throw new Error('Invalid expression');
+  return st[0];
+}
+
+function opPrec(op: Op | 'NOT'): number {
+  switch (op) {
+    case 'NOT':
+      return 4;
+    case 'AND':
+      return 3;
+    case 'XOR':
+      return 2;
+    case 'OR':
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+function astToLatex(node: ASTNode, parentPrec = 0): string {
+  switch (node.type) {
+    case 'VAR':
+      return node.name;
+    case 'CONST':
+      return node.value ? '1' : '0';
+    case 'NOT': {
+      const inner = astToLatex(node.expr, 0).replace(/\s+/g, '');
+      return `\\overline{${inner}}`;
+    }
+    case 'AND':
+    case 'OR':
+    case 'XOR': {
+      const p = opPrec(node.type);
+      const left = astToLatex(node.left, p);
+      const right = astToLatex(node.right, p);
+      const opLatex =
+        node.type === 'AND' ? '\\cdot' : node.type === 'OR' ? '+' : '\\oplus';
+      let res = `${left} ${opLatex} ${right}`;
+      if (p < parentPrec) res = `\\left(${res}\\right)`;
+      return res;
+    }
+  }
+}
+
 function evalRPN(rpn: Token[], env: Record<string, boolean>): boolean {
   const st: boolean[] = [];
   for (const t of rpn) {
@@ -174,7 +244,8 @@ function compile(expr: string) {
   const toks = tokenize(expr);
   const rpn = toRPN(toks);
   const vars = extractVars(toks);
-  return { rpn, vars };
+  const ast = rpnToAST(rpn);
+  return { rpn, vars, ast };
 }
 
 function allAssignments(vars: string[]): Record<string, boolean>[] {
@@ -199,7 +270,7 @@ export default function App() {
   const [expr2, setExpr2] = useState<string>("A‘*B");
   const [onlyDiff, setOnlyDiff] = useState(false);
 
-  const { table, vars, err } = useMemo(() => {
+  const { table, vars, err, latex1, latex2 } = useMemo(() => {
     try {
       const c1 = compile(expr1);
       const c2 = compile(expr2);
@@ -210,9 +281,11 @@ export default function App() {
         const v2 = evalRPN(c2.rpn, env);
         return { env, v1, v2, same: v1 === v2 };
       });
-      return { table: data, vars: allVars, err: null as string | null };
+      const latex1 = katex.renderToString(astToLatex(c1.ast), { throwOnError: false });
+      const latex2 = katex.renderToString(astToLatex(c2.ast), { throwOnError: false });
+      return { table: data, vars: allVars, err: null as string | null, latex1, latex2 };
     } catch (e: any) {
-      return { table: [] as any[], vars: [] as string[], err: e?.message ?? String(e) };
+      return { table: [] as any[], vars: [] as string[], err: e?.message ?? String(e), latex1: '', latex2: '' };
     }
   }, [expr1, expr2]);
 
@@ -240,6 +313,9 @@ export default function App() {
               onChange={(e) => setExpr1(e.target.value)}
               placeholder="e.g., (A+B')'"
             />
+            <div className="mt-2 min-h-[2rem] text-lg">
+              {latex1 && <span dangerouslySetInnerHTML={{ __html: latex1 }} />}
+            </div>
           </div>
           <div className="bg-white rounded-2xl shadow-sm p-4 border border-neutral-200">
             <label className="block text-sm font-medium mb-2">Expression 2</label>
@@ -249,6 +325,9 @@ export default function App() {
               onChange={(e) => setExpr2(e.target.value)}
               placeholder="e.g., A'*B"
             />
+            <div className="mt-2 min-h-[2rem] text-lg">
+              {latex2 && <span dangerouslySetInnerHTML={{ __html: latex2 }} />}
+            </div>
           </div>
         </section>
 
