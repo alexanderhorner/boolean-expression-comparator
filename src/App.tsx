@@ -1,4 +1,5 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
+import { useWindowVirtualizer } from '@tanstack/react-virtual';
 
 type Op = 'AND' | 'OR' | 'XOR' | 'NOT';
 
@@ -218,6 +219,18 @@ export default function App() {
 
   const display = useMemo(() => (onlyDiff ? table.filter((r) => !r.same) : table), [table, onlyDiff]);
 
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const rowVirtualizer = useWindowVirtualizer({
+    count: display.length,
+    estimateSize: () => 35,
+    overscan: 5,
+    scrollMargin: listRef.current?.offsetTop ?? 0,
+  });
+  const gridTemplate = useMemo(
+    () => `repeat(${vars.length + 2}, minmax(0,1fr))`,
+    [vars.length]
+  );
+
   return (
     <div className="min-h-screen w-full bg-neutral-50 text-neutral-900 p-6 flex flex-col">
       <div className="max-w-5xl mx-auto flex-1">
@@ -273,42 +286,58 @@ export default function App() {
           )}
         </section>
 
-        <div className="overflow-auto bg-white rounded-2xl shadow-sm border border-neutral-200">
-          <table className="min-w-full text-sm">
-            <thead className="bg-neutral-100 text-neutral-700 sticky top-0">
-              <tr>
-                {vars.map((v) => (
-                  <th key={v} className="px-3 py-2 text-left font-semibold">{v}</th>
-                ))}
-                <th className="px-3 py-2 text-left font-semibold">Expr 1</th>
-                <th className="px-3 py-2 text-left font-semibold">Expr 2</th>
-              </tr>
-            </thead>
-            <tbody>
-              {display.map((row, idx) => {
-                const rowClass = row.same ? 'bg-green-50' : 'bg-red-50';
-                return (
-                  <tr key={idx} className={rowClass + (idx % 2 === 1 ? ' ' : ' ')} >
-                    {vars.map((v) => (
-                      <td key={v} className="px-3 py-1.5 font-mono">{asBit(row.env[v])}</td>
-                    ))}
-                    <td className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v1)}</td>
-                    <td className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v2)}</td>
-                  </tr>
-                );
-              })}
-              {!err && display.length === 0 && (
-                <tr>
-                  <td className="px-3 py-4 text-neutral-500" colSpan={vars.length + 2}>No rows to display.</td>
-                </tr>
-              )}
-              {err && (
-                <tr>
-                  <td className="px-3 py-4 text-neutral-500" colSpan={vars.length + 2}>Fix the error to see the table.</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
+        <div ref={listRef} className="bg-white rounded-2xl shadow-sm border border-neutral-200">
+          <div className="min-w-full text-sm">
+            <div
+              className="bg-neutral-100 text-neutral-700 sticky top-0 grid"
+              style={{ gridTemplateColumns: gridTemplate }}
+            >
+              {vars.map((v) => (
+                <div key={v} className="px-3 py-2 font-semibold">{v}</div>
+              ))}
+              <div className="px-3 py-2 font-semibold">Expr 1</div>
+              <div className="px-3 py-2 font-semibold">Expr 2</div>
+            </div>
+            {err ? (
+              <div className="px-3 py-4 text-neutral-500">Fix the error to see the table.</div>
+            ) : display.length === 0 ? (
+              <div className="px-3 py-4 text-neutral-500">No rows to display.</div>
+            ) : (
+              <div
+                style={{
+                  height: `${rowVirtualizer.getTotalSize()}px`,
+                  width: '100%',
+                  position: 'relative',
+                }}
+              >
+                {rowVirtualizer.getVirtualItems().map((item) => {
+                  const row = display[item.index];
+                  const rowClass = row.same ? 'bg-green-50' : 'bg-red-50';
+                  return (
+                    <div
+                      key={item.key}
+                      className={`grid ${rowClass}`}
+                      style={{
+                        gridTemplateColumns: gridTemplate,
+                        position: 'absolute',
+                        top: 0,
+                        left: 0,
+                        width: '100%',
+                        height: `${item.size}px`,
+                        transform: `translateY(${item.start - rowVirtualizer.options.scrollMargin}px)`,
+                      }}
+                    >
+                      {vars.map((v) => (
+                        <div key={v} className="px-3 py-1.5 font-mono">{asBit(row.env[v])}</div>
+                      ))}
+                      <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v1)}</div>
+                      <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v2)}</div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
 
         <details className="mt-4 text-sm text-neutral-700">
