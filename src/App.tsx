@@ -286,7 +286,7 @@ export default function App() {
           )}
         </section>
 
-        <div ref={listRef} className="bg-white rounded-2xl shadow-sm border border-neutral-200">
+        <div ref={listRef} className="bg-white rounded-2xl overflow-hidden shadow-sm border border-neutral-200">
           <div className="min-w-full text-sm">
             <div
               className="bg-neutral-100 text-neutral-700 sticky top-0 grid"
