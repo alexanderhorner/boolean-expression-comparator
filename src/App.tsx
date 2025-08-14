@@ -25,7 +25,7 @@ function tokenize(srcRaw: string): Token[] {
   const tokens: Token[] = [];
   let i = 0;
   const isLetter = (ch: string) => /[A-Za-z]/.test(ch);
-  const isVarChar = (ch: string) => /[A-Za-z0-9_]/.test(ch);
+  const isVarRest = (ch: string) => /[0-9_]/.test(ch);
 
   while (i < src.length) {
     const ch = src[i];
@@ -46,10 +46,10 @@ function tokenize(srcRaw: string): Token[] {
     if (ch === '1') { tokens.push({ type: 'CONST', value: true }); i++; continue; }
     if (ch === '0') { tokens.push({ type: 'CONST', value: false }); i++; continue; }
 
-    // Variable (letters, then alnum/_)
+    // Variable: single letter, optionally followed by digits/underscores
     if (isLetter(ch)) {
       let j = i + 1;
-      while (j < src.length && isVarChar(src[j])) j++;
+      while (j < src.length && isVarRest(src[j])) j++;
       const name = src.slice(i, j);
       tokens.push({ type: 'VAR', name });
       i = j;
