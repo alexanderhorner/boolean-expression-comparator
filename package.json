@@ -10,6 +10,7 @@
     "test": "echo \"No tests\" && exit 0"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.13.12",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },

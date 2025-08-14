@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 
 type Op = 'AND' | 'OR' | 'XOR' | 'NOT';
 
@@ -218,6 +219,20 @@ export default function App() {
 
   const display = useMemo(() => (onlyDiff ? table.filter((r) => !r.same) : table), [table, onlyDiff]);
 
+  const parentRef = React.useRef<HTMLDivElement>(null);
+  const rowVirtualizer = useVirtualizer({
+    count: display.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 32,
+    overscan: 5,
+  });
+  const virtualRows = rowVirtualizer.getVirtualItems();
+  const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+  const paddingBottom =
+    virtualRows.length > 0
+      ? rowVirtualizer.getTotalSize() - virtualRows[virtualRows.length - 1].end
+      : 0;
+
   return (
     <div className="min-h-screen w-full bg-neutral-50 text-neutral-900 p-6 flex flex-col">
       <div className="max-w-5xl mx-auto flex-1">
@@ -273,7 +288,7 @@ export default function App() {
           )}
         </section>
 
-        <div className="overflow-auto bg-white rounded-2xl shadow-sm border border-neutral-200">
+        <div ref={parentRef} className="overflow-auto bg-white rounded-2xl shadow-sm border border-neutral-200">
           <table className="min-w-full text-sm">
             <thead className="bg-neutral-100 text-neutral-700 sticky top-0">
               <tr>
@@ -285,27 +300,62 @@ export default function App() {
               </tr>
             </thead>
             <tbody>
-              {display.map((row, idx) => {
-                const rowClass = row.same ? 'bg-green-50' : 'bg-red-50';
-                return (
-                  <tr key={idx} className={rowClass + (idx % 2 === 1 ? ' ' : ' ')} >
-                    {vars.map((v) => (
-                      <td key={v} className="px-3 py-1.5 font-mono">{asBit(row.env[v])}</td>
-                    ))}
-                    <td className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v1)}</td>
-                    <td className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v2)}</td>
-                  </tr>
-                );
-              })}
-              {!err && display.length === 0 && (
-                <tr>
-                  <td className="px-3 py-4 text-neutral-500" colSpan={vars.length + 2}>No rows to display.</td>
-                </tr>
-              )}
-              {err && (
-                <tr>
-                  <td className="px-3 py-4 text-neutral-500" colSpan={vars.length + 2}>Fix the error to see the table.</td>
-                </tr>
+              {!err && display.length > 0 ? (
+                <>
+                  {paddingTop > 0 && (
+                    <tr>
+                      <td style={{ height: paddingTop }} colSpan={vars.length + 2} />
+                    </tr>
+                  )}
+                  {virtualRows.map((virtualRow) => {
+                    const row = display[virtualRow.index];
+                    const rowClass = row.same ? 'bg-green-50' : 'bg-red-50';
+                    return (
+                      <tr
+                        key={virtualRow.key}
+                        className={rowClass + (virtualRow.index % 2 === 1 ? ' ' : ' ')}
+                      >
+                        {vars.map((v) => (
+                          <td key={v} className="px-3 py-1.5 font-mono">
+                            {asBit(row.env[v])}
+                          </td>
+                        ))}
+                        <td
+                          className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}
+                        >
+                          {asBit(row.v1)}
+                        </td>
+                        <td
+                          className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}
+                        >
+                          {asBit(row.v2)}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  {paddingBottom > 0 && (
+                    <tr>
+                      <td style={{ height: paddingBottom }} colSpan={vars.length + 2} />
+                    </tr>
+                  )}
+                </>
+              ) : (
+                <>
+                  {!err && display.length === 0 && (
+                    <tr>
+                      <td className="px-3 py-4 text-neutral-500" colSpan={vars.length + 2}>
+                        No rows to display.
+                      </td>
+                    </tr>
+                  )}
+                  {err && (
+                    <tr>
+                      <td className="px-3 py-4 text-neutral-500" colSpan={vars.length + 2}>
+                        Fix the error to see the table.
+                      </td>
+                    </tr>
+                  )}
+                </>
               )}
             </tbody>
           </table>
