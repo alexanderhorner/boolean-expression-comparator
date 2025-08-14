@@ -1,6 +1,5 @@
 import React, { useState, useMemo } from 'react';
-
-declare const katex: any;
+import katex from 'katex';
 
 type Op = 'AND' | 'OR' | 'XOR' | 'NOT';
 
