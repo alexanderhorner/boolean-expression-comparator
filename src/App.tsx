@@ -12,7 +12,7 @@ type Token =
   | { type: 'OP'; op: Op; prefix?: boolean }
   | { type: 'POSTFIX_NOT' };
 
-const unicodeApos = /[\u2018\u2019\u02BC]/g; // ‘ ’ ʻ
+const unicodeApos = /[\u2018\u2019\u02BC\u2032]/g; // ‘ ’ ʻ ′
 
 function normalizeInput(s: string): string {
   return s
@@ -62,8 +62,10 @@ function tokenize(srcRaw: string): Token[] {
 
   // Insert implicit ANDs: value-like then value-like or prefix-not or '('
   const out: Token[] = [];
-  const isValueLike = (t?: Token) => t && (t.type === 'VAR' || t.type === 'CONST' || t.type === 'RPAREN');
-  const isStartsValue = (t?: Token) => t && (t.type === 'VAR' || t.type === 'CONST' || t.type === 'LPAREN' || (t.type === 'OP' && t.prefix));
+  const isValueLike = (t?: Token) =>
+    t && (t.type === 'VAR' || t.type === 'CONST' || t.type === 'RPAREN');
+  const isStartsValue = (t?: Token) =>
+    t && (t.type === 'VAR' || t.type === 'CONST' || t.type === 'LPAREN' || (t.type === 'OP' && t.prefix));
 
   for (let k = 0; k < tokens.length; k++) {
     const t = tokens[k];
@@ -190,7 +192,7 @@ function astToLatex(node: ASTNode, parentPrec = 0): string {
     case 'CONST':
       return node.value ? '1' : '0';
     case 'NOT': {
-      const inner = astToLatex(node.expr, 0).replace(/\s+/g, '');
+      const inner = astToLatex(node.expr, 0).replace(/\s+/g, ' ').trim();
       return `\\overline{${inner}}`;
     }
     case 'AND':
