@@ -210,85 +210,37 @@ function astToLatex(node: ASTNode, parentPrec = 0): string {
   }
 }
 
-function makeFilledBitset(totalRows: number, value: boolean): Uint32Array {
-  const words = Math.ceil(totalRows / 32);
-  const out = new Uint32Array(words);
-  if (!value || words === 0) return out;
-  out.fill(0xffffffff);
-  const tailBits = totalRows & 31;
-  if (tailBits !== 0) {
-    out[words - 1] = (1 << tailBits) - 1;
-  }
-  return out;
-}
-
-function buildVariableBitsets(vars: string[], totalRows: number): Map<string, Uint32Array> {
-  const byVar = new Map<string, Uint32Array>();
-  for (let v = 0; v < vars.length; v++) {
-    const bits = new Uint32Array(Math.ceil(totalRows / 32));
-    const block = 1 << (vars.length - 1 - v);
-    const cycle = block << 1;
-    for (let i = block; i < totalRows; i += cycle) {
-      const end = Math.min(i + block, totalRows);
-      for (let r = i; r < end; r++) {
-        bits[r >>> 5] |= 1 << (r & 31);
+function evalRPNAtRow(
+  rpn: Token[],
+  varPositions: Map<string, number>,
+  row: number,
+  totalVars: number,
+  stack: boolean[],
+): boolean {
+  let sp = 0;
+  for (const t of rpn) {
+    if (t.type === 'CONST') {
+      stack[sp++] = t.value;
+    } else if (t.type === 'VAR') {
+      const pos = varPositions.get(t.name);
+      if (pos === undefined) throw new Error(`Variable '${t.name}' is undefined`);
+      stack[sp++] = getAssignmentBit(row, pos, totalVars);
+    } else if (t.type === 'OP') {
+      if (t.op === 'NOT') {
+        if (sp < 1) throw new Error('NOT missing operand');
+        stack[sp - 1] = !stack[sp - 1];
+      } else {
+        if (sp < 2) throw new Error(`${t.op} missing operand`);
+        const b = stack[--sp];
+        const a = stack[sp - 1];
+        if (t.op === 'AND') stack[sp - 1] = a && b;
+        else if (t.op === 'OR') stack[sp - 1] = a || b;
+        else stack[sp - 1] = a !== b;
       }
     }
-    byVar.set(vars[v], bits);
   }
-  return byVar;
-}
-
-function evalRPNBitset(rpn: Token[], vars: Map<string, Uint32Array>, totalRows: number): Uint32Array {
-  const stack: Uint32Array[] = [];
-  const words = Math.ceil(totalRows / 32);
-  const allTrue = makeFilledBitset(totalRows, true);
-  const allFalse = new Uint32Array(words);
-  const tailBits = totalRows & 31;
-  const tailMask = tailBits === 0 ? 0xffffffff : (1 << tailBits) - 1;
-
-  for (const t of rpn) {
-    if (t.type === 'VAR') {
-      const col = vars.get(t.name);
-      if (!col) throw new Error(`Unknown variable ${t.name}`);
-      stack.push(col);
-      continue;
-    }
-    if (t.type === 'CONST') {
-      stack.push(t.value ? allTrue : allFalse);
-      continue;
-    }
-    if (t.type !== 'OP') continue;
-    if (t.op === 'NOT') {
-      if (stack.length < 1) throw new Error('NOT missing operand');
-      const a = stack.pop()!;
-      const out = new Uint32Array(words);
-      for (let i = 0; i < words; i++) out[i] = ~a[i];
-      if (words > 0) out[words - 1] &= tailMask;
-      stack.push(out);
-      continue;
-    }
-
-    if (stack.length < 2) throw new Error(`${t.op} missing operand`);
-    const b = stack.pop()!;
-    const a = stack.pop()!;
-    const out = new Uint32Array(words);
-    if (t.op === 'AND') {
-      for (let i = 0; i < words; i++) out[i] = a[i] & b[i];
-    } else if (t.op === 'OR') {
-      for (let i = 0; i < words; i++) out[i] = a[i] | b[i];
-    } else {
-      for (let i = 0; i < words; i++) out[i] = a[i] ^ b[i];
-    }
-    stack.push(out);
-  }
-
-  if (stack.length !== 1) throw new Error('Invalid expression');
+  if (sp !== 1) throw new Error('Invalid expression');
   return stack[0];
-}
-
-function getBit(bits: Uint32Array, row: number): boolean {
-  return ((bits[row >>> 5] >>> (row & 31)) & 1) === 1;
 }
 
 function getAssignmentBit(row: number, varPosition: number, varCount: number): boolean {
@@ -316,33 +268,56 @@ export default function App() {
   const [expr2, setExpr2] = useState<string>("A‘*B");
   const [onlyDiff, setOnlyDiff] = useState(false);
 
-  const { table, vars, err, latex1, latex2 } = useMemo(() => {
+  const { vars, err, latex1, latex2, displayCount, getDisplayRow } = useMemo(() => {
     try {
       const c1 = compile(expr1);
       const c2 = compile(expr2);
       const allVars = Array.from(new Set([...c1.vars, ...c2.vars])).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
       const totalRows = Math.max(1, 2 ** allVars.length);
-      const varBitsets = buildVariableBitsets(allVars, totalRows);
-      const v1Bits = evalRPNBitset(c1.rpn, varBitsets, totalRows);
-      const v2Bits = evalRPNBitset(c2.rpn, varBitsets, totalRows);
-      const data = Array.from({ length: totalRows }, (_, row) => {
-        const v1 = getBit(v1Bits, row);
-        const v2 = getBit(v2Bits, row);
-        return { row, v1, v2, same: v1 === v2 };
-      });
+      const varPositions = new Map<string, number>(allVars.map((name, idx) => [name, idx]));
       const latex1 = katex.renderToString(astToLatex(c1.ast), { throwOnError: false });
       const latex2 = katex.renderToString(astToLatex(c2.ast), { throwOnError: false });
-      return { table: data, vars: allVars, err: null as string | null, latex1, latex2 };
-    } catch (e: any) {
-      return { table: [] as any[], vars: [] as string[], err: e?.message ?? String(e), latex1: '', latex2: '' };
-    }
-  }, [expr1, expr2]);
 
-  const display = useMemo(() => (onlyDiff ? table.filter((r) => !r.same) : table), [table, onlyDiff]);
+      const stack1: boolean[] = [];
+      const stack2: boolean[] = [];
+      const rowCache = new Map<number, { row: number; v1: boolean; v2: boolean; same: boolean }>();
+      const evalRow = (row: number) => {
+        const cached = rowCache.get(row);
+        if (cached) return cached;
+        const v1 = evalRPNAtRow(c1.rpn, varPositions, row, allVars.length, stack1);
+        const v2 = evalRPNAtRow(c2.rpn, varPositions, row, allVars.length, stack2);
+        const result = { row, v1, v2, same: v1 === v2 };
+        rowCache.set(row, result);
+        return result;
+      };
+
+      let differingRows: number[] | null = null;
+      if (onlyDiff) {
+        differingRows = [];
+        for (let row = 0; row < totalRows; row++) {
+          if (!evalRow(row).same) differingRows.push(row);
+        }
+      }
+
+      const displayCount = onlyDiff ? (differingRows?.length ?? 0) : totalRows;
+      const getDisplayRow = (index: number) => evalRow(onlyDiff ? differingRows![index] : index);
+
+      return { vars: allVars, err: null as string | null, latex1, latex2, displayCount, getDisplayRow };
+    } catch (e: any) {
+      return {
+        vars: [] as string[],
+        err: e?.message ?? String(e),
+        latex1: '',
+        latex2: '',
+        displayCount: 0,
+        getDisplayRow: (_index: number) => ({ row: 0, v1: false, v2: false, same: true }),
+      };
+    }
+  }, [expr1, expr2, onlyDiff]);
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const rowVirtualizer = useWindowVirtualizer({
-    count: display.length,
+    count: displayCount,
     estimateSize: () => 35,
     overscan: 5,
     scrollMargin: listRef.current?.offsetTop ?? 0,
@@ -427,7 +402,7 @@ export default function App() {
             </div>
             {err ? (
               <div className="px-3 py-4 text-neutral-500">Fix the error to see the table.</div>
-            ) : display.length === 0 ? (
+            ) : displayCount === 0 ? (
               <div className="px-3 py-4 text-neutral-500">No rows to display.</div>
             ) : (
               <div
@@ -438,7 +413,7 @@ export default function App() {
                 }}
               >
                 {rowVirtualizer.getVirtualItems().map((item) => {
-                  const row = display[item.index];
+                  const row = getDisplayRow(item.index);
                   const rowClass = row.same ? 'bg-green-50' : 'bg-red-50';
                   return (
                     <div
