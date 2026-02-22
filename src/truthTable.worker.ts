@@ -207,7 +207,7 @@ function collectSetBitIndices(bits: Uint32Array, totalRows: number): Uint32Array
   return out;
 }
 
-type WorkerRequest = { id: number; expr1: string; expr2: string };
+type WorkerRequest = { id: number; expr1: string; expr2: string; needDiffRows: boolean };
 
 type WorkerResponse = {
   id: number;
@@ -217,15 +217,19 @@ type WorkerResponse = {
   v2Bits: Uint32Array;
   diffRows: Uint32Array;
   timings: { parseMs: number; prepMs: number; evalMs: number; diffMs: number; totalMs: number };
+  diffCount: number;
   err: string | null;
 };
 
 const cache = new Map<string, Omit<WorkerResponse, 'id'>>();
+
+const MAX_VARIABLES = 25;
 const CACHE_LIMIT = 8;
 
+
 self.onmessage = (evt: MessageEvent<WorkerRequest>) => {
-  const { id, expr1, expr2 } = evt.data;
-  const key = `${expr1}\u0000${expr2}`;
+  const { id, expr1, expr2, needDiffRows } = evt.data;
+  const key = `${expr1}\u0000${expr2}\u0000${needDiffRows ? '1' : '0'}`;
   const hit = cache.get(key);
   if (hit) {
     const clone: WorkerResponse = {
@@ -246,6 +250,9 @@ self.onmessage = (evt: MessageEvent<WorkerRequest>) => {
     const c1Rpn = toRPN(c1Tokens);
     const c2Rpn = toRPN(c2Tokens);
     const vars = Array.from(new Set([...extractVars(c1Tokens), ...extractVars(c2Tokens)])).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    if (vars.length > MAX_VARIABLES) {
+      throw new Error(`Too many variables (${vars.length}). Maximum supported is ${MAX_VARIABLES} to prevent browser crashes.`);
+    }
     const t1 = performance.now();
 
     const totalRows = Math.max(1, 2 ** vars.length);
@@ -258,7 +265,9 @@ self.onmessage = (evt: MessageEvent<WorkerRequest>) => {
 
     const diffBits = new Uint32Array(v1Bits.length);
     for (let i = 0; i < diffBits.length; i++) diffBits[i] = v1Bits[i] ^ v2Bits[i];
-    const diffRows = collectSetBitIndices(diffBits, totalRows);
+    let diffCount = 0;
+    for (let i = 0; i < diffBits.length; i++) diffCount += popcount32(diffBits[i]);
+    const diffRows = needDiffRows ? collectSetBitIndices(diffBits, totalRows) : new Uint32Array(0);
     const t4 = performance.now();
 
     const payload: Omit<WorkerResponse, 'id'> = {
@@ -268,12 +277,15 @@ self.onmessage = (evt: MessageEvent<WorkerRequest>) => {
       v2Bits,
       diffRows,
       timings: { parseMs: t1 - t0, prepMs: t2 - t1, evalMs: t3 - t2, diffMs: t4 - t3, totalMs: t4 - t0 },
+      diffCount,
       err: null,
     };
 
-    cache.delete(key);
-    cache.set(key, payload);
-    if (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value!);
+    if (vars.length <= 22) {
+      cache.delete(key);
+      cache.set(key, payload);
+      if (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value!);
+    }
 
     const out: WorkerResponse = { ...payload, id };
     (self as unknown as Worker).postMessage(out, [out.v1Bits.buffer, out.v2Bits.buffer, out.diffRows.buffer]);
@@ -286,6 +298,7 @@ self.onmessage = (evt: MessageEvent<WorkerRequest>) => {
       v2Bits: new Uint32Array(0),
       diffRows: new Uint32Array(0),
       timings: { parseMs: 0, prepMs: 0, evalMs: 0, diffMs: 0, totalMs: performance.now() - t0 },
+      diffCount: 0,
       err: e?.message ?? String(e),
     };
     (self as unknown as Worker).postMessage(out, [out.v1Bits.buffer, out.v2Bits.buffer, out.diffRows.buffer]);

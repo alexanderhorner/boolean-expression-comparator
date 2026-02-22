@@ -22,6 +22,7 @@ type WorkerResult = {
   v2Bits: Uint32Array;
   diffRows: Uint32Array;
   timings: { parseMs: number; prepMs: number; evalMs: number; diffMs: number; totalMs: number };
+  diffCount: number;
   err: string | null;
 };
 
@@ -266,6 +267,7 @@ export default function App() {
     v2Bits: new Uint32Array(0),
     diffRows: new Uint32Array(0),
     timings: { parseMs: 0, prepMs: 0, evalMs: 0, diffMs: 0, totalMs: 0 },
+    diffCount: 0,
     err: null,
   });
   const [isComputing, setIsComputing] = useState(false);
@@ -284,6 +286,7 @@ export default function App() {
         v2Bits: evt.data.v2Bits,
         diffRows: evt.data.diffRows,
         timings: evt.data.timings,
+        diffCount: evt.data.diffCount,
         err: evt.data.err,
       });
       setIsComputing(false);
@@ -296,8 +299,8 @@ export default function App() {
     if (!worker) return;
     requestIdRef.current += 1;
     setIsComputing(true);
-    worker.postMessage({ id: requestIdRef.current, expr1, expr2 });
-  }, [expr1, expr2]);
+    worker.postMessage({ id: requestIdRef.current, expr1, expr2, needDiffRows: onlyDiff });
+  }, [expr1, expr2, onlyDiff]);
 
   const { latex1, latex2, latexErr, latexMs } = useMemo(() => {
     const t0 = performance.now();
@@ -321,7 +324,7 @@ export default function App() {
   const v2Bits = workerData.v2Bits;
   const diffRows = workerData.diffRows;
   const err = workerData.err ?? latexErr;
-  const displayCount = onlyDiff ? diffRows.length : totalRows;
+  const displayCount = onlyDiff ? workerData.diffCount : totalRows;
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const rowVirtualizer = useVirtualizer({
@@ -394,7 +397,7 @@ export default function App() {
           ) : (
             <div className="text-sm text-neutral-600 text-right">
               <div>Variables: {vars.length ? vars.join(', ') : '—'}</div>
-              {!err && <div className="text-xs text-neutral-500">Worker: {workerData.timings.totalMs.toFixed(2)}ms (parse {workerData.timings.parseMs.toFixed(2)} · prep {workerData.timings.prepMs.toFixed(2)} · eval {workerData.timings.evalMs.toFixed(2)}) · KaTeX: {latexMs.toFixed(2)}ms{isComputing ? " · computing…" : ""}</div>}
+              {!err && <div className="text-xs text-neutral-500">Worker: {workerData.timings.totalMs.toFixed(2)}ms (parse {workerData.timings.parseMs.toFixed(2)} · prep {workerData.timings.prepMs.toFixed(2)} · eval {workerData.timings.evalMs.toFixed(2)}) · Diff rows: {workerData.diffCount.toLocaleString()} · KaTeX: {latexMs.toFixed(2)}ms{isComputing ? " · computing…" : ""}</div>}
             </div>
           )}
         </section>
