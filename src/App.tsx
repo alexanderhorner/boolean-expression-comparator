@@ -1,6 +1,6 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import katex from 'katex';
-import { useWindowVirtualizer } from '@tanstack/react-virtual';
+import { useVirtualizer } from '@tanstack/react-virtual';
 
 type Op = 'AND' | 'OR' | 'XOR' | 'NOT';
 
@@ -13,6 +13,18 @@ type Token =
   | { type: 'POSTFIX_NOT' };
 
 const unicodeApos = /[\u2018\u2019\u02BC\u2032]/g; // ‘ ’ ʻ ′
+
+
+type WorkerResult = {
+  vars: string[];
+  totalRows: number;
+  v1Bits: Uint32Array;
+  v2Bits: Uint32Array;
+  diffRows: Uint32Array;
+  timings: { parseMs: number; prepMs: number; evalMs: number; diffMs: number; totalMs: number };
+  err: string | null;
+};
+
 
 function normalizeInput(s: string): string {
   return s
@@ -211,101 +223,8 @@ function astToLatex(node: ASTNode, parentPrec = 0): string {
   }
 }
 
-function makeFilledBitset(totalRows: number, value: boolean): Uint32Array {
-  const words = Math.ceil(totalRows / 32);
-  const out = new Uint32Array(words);
-  if (!value || words === 0) return out;
-  out.fill(0xffffffff);
-  const tailBits = totalRows & 31;
-  if (tailBits !== 0) {
-    out[words - 1] = (1 << tailBits) - 1;
-  }
-  return out;
-}
 
-function buildVariableBitsets(vars: string[], totalRows: number): Map<string, Uint32Array> {
-  const byVar = new Map<string, Uint32Array>();
-  const words = Math.ceil(totalRows / 32);
-  for (let v = 0; v < vars.length; v++) {
-    const bits = new Uint32Array(words);
-    const block = 2 ** (vars.length - 1 - v);
 
-    if (block >= 32) {
-      const onesWords = block >>> 5;
-      const cycleWords = onesWords << 1;
-      for (let start = 0; start < words; start += cycleWords) {
-        const onesStart = start + onesWords;
-        const onesEnd = Math.min(onesStart + onesWords, words);
-        if (onesStart < words) bits.fill(0xffffffff, onesStart, onesEnd);
-      }
-    } else {
-      const cycle = block << 1;
-      let pattern = 0;
-      for (let bit = 0; bit < 32; bit++) {
-        if ((bit % cycle) >= block) pattern |= (1 << bit) >>> 0;
-      }
-      bits.fill(pattern >>> 0);
-    }
-
-    byVar.set(vars[v], bits);
-  }
-
-  const tailBits = totalRows & 31;
-  if (tailBits !== 0 && words > 0) {
-    const tailMask = ((1 << tailBits) - 1) >>> 0;
-    for (const bits of byVar.values()) bits[words - 1] &= tailMask;
-  }
-
-  return byVar;
-}
-
-function evalRPNBitset(rpn: Token[], vars: Map<string, Uint32Array>, totalRows: number): Uint32Array {
-  const stack: Uint32Array[] = [];
-  const words = Math.ceil(totalRows / 32);
-  const allTrue = makeFilledBitset(totalRows, true);
-  const allFalse = new Uint32Array(words);
-  const tailBits = totalRows & 31;
-  const tailMask = tailBits === 0 ? 0xffffffff : (1 << tailBits) - 1;
-
-  for (const t of rpn) {
-    if (t.type === 'VAR') {
-      const col = vars.get(t.name);
-      if (!col) throw new Error(`Unknown variable ${t.name}`);
-      stack.push(col);
-      continue;
-    }
-    if (t.type === 'CONST') {
-      stack.push(t.value ? allTrue : allFalse);
-      continue;
-    }
-    if (t.type !== 'OP') continue;
-    if (t.op === 'NOT') {
-      if (stack.length < 1) throw new Error('NOT missing operand');
-      const a = stack.pop()!;
-      const out = new Uint32Array(words);
-      for (let i = 0; i < words; i++) out[i] = ~a[i];
-      if (words > 0) out[words - 1] &= tailMask;
-      stack.push(out);
-      continue;
-    }
-
-    if (stack.length < 2) throw new Error(`${t.op} missing operand`);
-    const b = stack.pop()!;
-    const a = stack.pop()!;
-    const out = new Uint32Array(words);
-    if (t.op === 'AND') {
-      for (let i = 0; i < words; i++) out[i] = a[i] & b[i];
-    } else if (t.op === 'OR') {
-      for (let i = 0; i < words; i++) out[i] = a[i] | b[i];
-    } else {
-      for (let i = 0; i < words; i++) out[i] = a[i] ^ b[i];
-    }
-    stack.push(out);
-  }
-
-  if (stack.length !== 1) throw new Error('Invalid expression');
-  return stack[0];
-}
 
 function getBit(bits: Uint32Array, row: number): boolean {
   return ((bits[row >>> 5] >>> (row & 31)) & 1) === 1;
@@ -316,29 +235,7 @@ function getAssignmentBit(row: number, varPosition: number, varCount: number): b
 }
 
 
-function popcount32(x: number): number {
-  x -= (x >>> 1) & 0x55555555;
-  x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
-  return (((x + (x >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
-}
 
-function collectSetBitIndices(bits: Uint32Array, totalRows: number): Uint32Array {
-  let count = 0;
-  for (let i = 0; i < bits.length; i++) count += popcount32(bits[i]);
-  const out = new Uint32Array(count);
-  let idx = 0;
-  for (let wordIndex = 0; wordIndex < bits.length; wordIndex++) {
-    let word = bits[wordIndex];
-    while (word !== 0) {
-      const lsb = word & -word;
-      const bitPos = 31 - Math.clz32(lsb);
-      const row = (wordIndex << 5) + bitPos;
-      if (row < totalRows) out[idx++] = row;
-      word ^= lsb;
-    }
-  }
-  return out;
-}
 
 function extractVars(tokens: Token[]): string[] {
   const set = new Set<string>();
@@ -361,66 +258,77 @@ export default function App() {
   const [expr2, setExpr2] = useState<string>("A‘*B");
   const [onlyDiff, setOnlyDiff] = useState(false);
 
-  const { vars, err, latex1, latex2, totalRows, v1Bits, v2Bits, diffRows, timings } = useMemo(() => {
+
+  const [workerData, setWorkerData] = useState<WorkerResult>({
+    vars: [],
+    totalRows: 0,
+    v1Bits: new Uint32Array(0),
+    v2Bits: new Uint32Array(0),
+    diffRows: new Uint32Array(0),
+    timings: { parseMs: 0, prepMs: 0, evalMs: 0, diffMs: 0, totalMs: 0 },
+    err: null,
+  });
+  const [isComputing, setIsComputing] = useState(false);
+  const workerRef = useRef<Worker | null>(null);
+  const requestIdRef = useRef(0);
+
+  useEffect(() => {
+    const worker = new Worker(new URL('./truthTable.worker.ts', import.meta.url), { type: 'module' });
+    workerRef.current = worker;
+    worker.onmessage = (evt: MessageEvent<WorkerResult & { id: number }>) => {
+      if (evt.data.id !== requestIdRef.current) return;
+      setWorkerData({
+        vars: evt.data.vars,
+        totalRows: evt.data.totalRows,
+        v1Bits: evt.data.v1Bits,
+        v2Bits: evt.data.v2Bits,
+        diffRows: evt.data.diffRows,
+        timings: evt.data.timings,
+        err: evt.data.err,
+      });
+      setIsComputing(false);
+    };
+    return () => worker.terminate();
+  }, []);
+
+  useEffect(() => {
+    const worker = workerRef.current;
+    if (!worker) return;
+    requestIdRef.current += 1;
+    setIsComputing(true);
+    worker.postMessage({ id: requestIdRef.current, expr1, expr2 });
+  }, [expr1, expr2]);
+
+  const { latex1, latex2, latexErr, latexMs } = useMemo(() => {
+    const t0 = performance.now();
     try {
-      const t0 = performance.now();
       const c1 = compile(expr1);
       const c2 = compile(expr2);
-      const allVars = Array.from(new Set([...c1.vars, ...c2.vars])).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-      const t1 = performance.now();
-      const rowCount = Math.max(1, 2 ** allVars.length);
-      const varBitsets = buildVariableBitsets(allVars, rowCount);
-      const t2 = performance.now();
-      const leftBits = evalRPNBitset(c1.rpn, varBitsets, rowCount);
-      const rightBits = evalRPNBitset(c2.rpn, varBitsets, rowCount);
-      const t3 = performance.now();
-      const diffBits = new Uint32Array(leftBits.length);
-      for (let i = 0; i < diffBits.length; i++) diffBits[i] = leftBits[i] ^ rightBits[i];
-      const differingRows = collectSetBitIndices(diffBits, rowCount);
-      const t4 = performance.now();
-      const latex1 = katex.renderToString(astToLatex(c1.ast), { throwOnError: false });
-      const latex2 = katex.renderToString(astToLatex(c2.ast), { throwOnError: false });
-      const t5 = performance.now();
       return {
-        vars: allVars,
-        err: null as string | null,
-        latex1,
-        latex2,
-        totalRows: rowCount,
-        v1Bits: leftBits,
-        v2Bits: rightBits,
-        diffRows: differingRows,
-        timings: {
-          parseMs: t1 - t0,
-          varsMs: t2 - t1,
-          evalMs: t3 - t2,
-          diffMs: t4 - t3,
-          latexMs: t5 - t4,
-        },
+        latex1: katex.renderToString(astToLatex(c1.ast), { throwOnError: false }),
+        latex2: katex.renderToString(astToLatex(c2.ast), { throwOnError: false }),
+        latexErr: null as string | null,
+        latexMs: performance.now() - t0,
       };
     } catch (e: any) {
-      return {
-        vars: [] as string[],
-        err: e?.message ?? String(e),
-        latex1: '',
-        latex2: '',
-        totalRows: 0,
-        v1Bits: new Uint32Array(0),
-        v2Bits: new Uint32Array(0),
-        diffRows: new Uint32Array(0),
-        timings: { parseMs: 0, varsMs: 0, evalMs: 0, diffMs: 0, latexMs: 0 },
-      };
+      return { latex1: '', latex2: '', latexErr: e?.message ?? String(e), latexMs: performance.now() - t0 };
     }
   }, [expr1, expr2]);
 
+  const vars = workerData.vars;
+  const totalRows = workerData.totalRows;
+  const v1Bits = workerData.v1Bits;
+  const v2Bits = workerData.v2Bits;
+  const diffRows = workerData.diffRows;
+  const err = workerData.err ?? latexErr;
   const displayCount = onlyDiff ? diffRows.length : totalRows;
 
   const listRef = useRef<HTMLDivElement | null>(null);
-  const rowVirtualizer = useWindowVirtualizer({
+  const rowVirtualizer = useVirtualizer({
     count: displayCount,
+    getScrollElement: () => listRef.current,
     estimateSize: () => 35,
-    overscan: 5,
-    scrollMargin: listRef.current?.offsetTop ?? 0,
+    overscan: 8,
   });
   const gridTemplate = useMemo(
     () => `repeat(${vars.length + 2}, minmax(0,1fr))`,
@@ -486,12 +394,12 @@ export default function App() {
           ) : (
             <div className="text-sm text-neutral-600 text-right">
               <div>Variables: {vars.length ? vars.join(', ') : '—'}</div>
-              {!err && <div className="text-xs text-neutral-500">Compute: {(timings.evalMs + timings.diffMs).toFixed(2)}ms · Parse+prep: {(timings.parseMs + timings.varsMs).toFixed(2)}ms</div>}
+              {!err && <div className="text-xs text-neutral-500">Worker: {workerData.timings.totalMs.toFixed(2)}ms (parse {workerData.timings.parseMs.toFixed(2)} · prep {workerData.timings.prepMs.toFixed(2)} · eval {workerData.timings.evalMs.toFixed(2)}) · KaTeX: {latexMs.toFixed(2)}ms{isComputing ? " · computing…" : ""}</div>}
             </div>
           )}
         </section>
 
-        <div ref={listRef} className="bg-white rounded-2xl overflow-hidden shadow-sm border border-neutral-200">
+        <div ref={listRef} className="bg-white rounded-2xl overflow-auto shadow-sm border border-neutral-200 h-[70vh]">
           <div className="min-w-full text-sm">
             <div
               className="bg-neutral-100 text-neutral-700 sticky top-0 grid"
@@ -532,7 +440,7 @@ export default function App() {
                         left: 0,
                         width: '100%',
                         height: `${item.size}px`,
-                        transform: `translateY(${item.start - rowVirtualizer.options.scrollMargin}px)`,
+                        transform: `translateY(${item.start}px)`,
                       }}
                     >
                       {vars.map((v, idx) => (
