@@ -210,30 +210,114 @@ function astToLatex(node: ASTNode, parentPrec = 0): string {
   }
 }
 
-function evalRPN(rpn: Token[], env: Record<string, boolean>): boolean {
-  const st: boolean[] = [];
-  for (const t of rpn) {
-    if (t.type === 'CONST') st.push(t.value);
-    else if (t.type === 'VAR') {
-      if (!(t.name in env)) throw new Error(`Variable '${t.name}' is undefined`);
-      st.push(env[t.name]);
-    } else if (t.type === 'OP') {
-      if (t.op === 'NOT') {
-        if (st.length < 1) throw new Error('NOT missing operand');
-        const a = st.pop()!;
-        st.push(!a);
-      } else {
-        if (st.length < 2) throw new Error(`${t.op} missing operand`);
-        const b = st.pop()!;
-        const a = st.pop()!;
-        if (t.op === 'AND') st.push(a && b);
-        else if (t.op === 'OR') st.push(a || b);
-        else if (t.op === 'XOR') st.push(a !== b);
+function makeFilledBitset(totalRows: number, value: boolean): Uint32Array {
+  const words = Math.ceil(totalRows / 32);
+  const out = new Uint32Array(words);
+  if (!value || words === 0) return out;
+  out.fill(0xffffffff);
+  const tailBits = totalRows & 31;
+  if (tailBits !== 0) {
+    out[words - 1] = (1 << tailBits) - 1;
+  }
+  return out;
+}
+
+function buildVariableBitsets(vars: string[], totalRows: number): Map<string, Uint32Array> {
+  const byVar = new Map<string, Uint32Array>();
+  for (let v = 0; v < vars.length; v++) {
+    const bits = new Uint32Array(Math.ceil(totalRows / 32));
+    const block = 1 << (vars.length - 1 - v);
+    const cycle = block << 1;
+    for (let i = block; i < totalRows; i += cycle) {
+      const end = Math.min(i + block, totalRows);
+      for (let r = i; r < end; r++) {
+        bits[r >>> 5] |= 1 << (r & 31);
       }
     }
+    byVar.set(vars[v], bits);
   }
-  if (st.length !== 1) throw new Error('Invalid expression');
-  return st[0];
+  return byVar;
+}
+
+function evalRPNBitset(rpn: Token[], vars: Map<string, Uint32Array>, totalRows: number): Uint32Array {
+  const stack: Uint32Array[] = [];
+  const words = Math.ceil(totalRows / 32);
+  const allTrue = makeFilledBitset(totalRows, true);
+  const allFalse = new Uint32Array(words);
+  const tailBits = totalRows & 31;
+  const tailMask = tailBits === 0 ? 0xffffffff : (1 << tailBits) - 1;
+
+  for (const t of rpn) {
+    if (t.type === 'VAR') {
+      const col = vars.get(t.name);
+      if (!col) throw new Error(`Unknown variable ${t.name}`);
+      stack.push(col);
+      continue;
+    }
+    if (t.type === 'CONST') {
+      stack.push(t.value ? allTrue : allFalse);
+      continue;
+    }
+    if (t.type !== 'OP') continue;
+    if (t.op === 'NOT') {
+      if (stack.length < 1) throw new Error('NOT missing operand');
+      const a = stack.pop()!;
+      const out = new Uint32Array(words);
+      for (let i = 0; i < words; i++) out[i] = ~a[i];
+      if (words > 0) out[words - 1] &= tailMask;
+      stack.push(out);
+      continue;
+    }
+
+    if (stack.length < 2) throw new Error(`${t.op} missing operand`);
+    const b = stack.pop()!;
+    const a = stack.pop()!;
+    const out = new Uint32Array(words);
+    if (t.op === 'AND') {
+      for (let i = 0; i < words; i++) out[i] = a[i] & b[i];
+    } else if (t.op === 'OR') {
+      for (let i = 0; i < words; i++) out[i] = a[i] | b[i];
+    } else {
+      for (let i = 0; i < words; i++) out[i] = a[i] ^ b[i];
+    }
+    stack.push(out);
+  }
+
+  if (stack.length !== 1) throw new Error('Invalid expression');
+  return stack[0];
+}
+
+function getBit(bits: Uint32Array, row: number): boolean {
+  return ((bits[row >>> 5] >>> (row & 31)) & 1) === 1;
+}
+
+function getAssignmentBit(row: number, varPosition: number, varCount: number): boolean {
+  return ((row >>> (varCount - 1 - varPosition)) & 1) === 1;
+}
+
+
+function popcount32(x: number): number {
+  x -= (x >>> 1) & 0x55555555;
+  x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+  return (((x + (x >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+}
+
+function collectSetBitIndices(bits: Uint32Array, totalRows: number): Uint32Array {
+  let count = 0;
+  for (let i = 0; i < bits.length; i++) count += popcount32(bits[i]);
+  const out = new Uint32Array(count);
+  let idx = 0;
+  for (let wordIndex = 0; wordIndex < bits.length; wordIndex++) {
+    let word = bits[wordIndex];
+    while (word !== 0) {
+      const lsb = word & -word;
+      const bitPos = 31 - Math.clz32(lsb);
+      const row = (wordIndex << 5) + bitPos;
+      if (row < totalRows) out[idx++] = row;
+      word ^= lsb;
+    }
+  }
+  return out;
 }
 
 function extractVars(tokens: Token[]): string[] {
@@ -250,21 +334,6 @@ function compile(expr: string) {
   return { rpn, vars, ast };
 }
 
-function allAssignments(vars: string[]): Record<string, boolean>[] {
-  const n = vars.length;
-  const out: Record<string, boolean>[] = [];
-  const total = Math.max(1, 1 << n);
-  for (let i = 0; i < total; i++) {
-    const row: Record<string, boolean> = {};
-    for (let v = 0; v < n; v++) {
-      const bit = (i >> (n - 1 - v)) & 1;
-      row[vars[v]] = !!bit;
-    }
-    out.push(row);
-  }
-  return out;
-}
-
 function asBit(b: boolean): 0 | 1 { return b ? 1 : 0; }
 
 export default function App() {
@@ -272,30 +341,63 @@ export default function App() {
   const [expr2, setExpr2] = useState<string>("A‘*B");
   const [onlyDiff, setOnlyDiff] = useState(false);
 
-  const { table, vars, err, latex1, latex2 } = useMemo(() => {
+  const { vars, err, latex1, latex2, totalRows, v1Bits, v2Bits, diffRows, timings } = useMemo(() => {
     try {
+      const t0 = performance.now();
       const c1 = compile(expr1);
       const c2 = compile(expr2);
       const allVars = Array.from(new Set([...c1.vars, ...c2.vars])).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-      const rows = allAssignments(allVars);
-      const data = rows.map((env) => {
-        const v1 = evalRPN(c1.rpn, env);
-        const v2 = evalRPN(c2.rpn, env);
-        return { env, v1, v2, same: v1 === v2 };
-      });
+      const t1 = performance.now();
+      const rowCount = Math.max(1, 2 ** allVars.length);
+      const varBitsets = buildVariableBitsets(allVars, rowCount);
+      const t2 = performance.now();
+      const leftBits = evalRPNBitset(c1.rpn, varBitsets, rowCount);
+      const rightBits = evalRPNBitset(c2.rpn, varBitsets, rowCount);
+      const t3 = performance.now();
+      const diffBits = new Uint32Array(leftBits.length);
+      for (let i = 0; i < diffBits.length; i++) diffBits[i] = leftBits[i] ^ rightBits[i];
+      const differingRows = collectSetBitIndices(diffBits, rowCount);
+      const t4 = performance.now();
       const latex1 = katex.renderToString(astToLatex(c1.ast), { throwOnError: false });
       const latex2 = katex.renderToString(astToLatex(c2.ast), { throwOnError: false });
-      return { table: data, vars: allVars, err: null as string | null, latex1, latex2 };
+      const t5 = performance.now();
+      return {
+        vars: allVars,
+        err: null as string | null,
+        latex1,
+        latex2,
+        totalRows: rowCount,
+        v1Bits: leftBits,
+        v2Bits: rightBits,
+        diffRows: differingRows,
+        timings: {
+          parseMs: t1 - t0,
+          varsMs: t2 - t1,
+          evalMs: t3 - t2,
+          diffMs: t4 - t3,
+          latexMs: t5 - t4,
+        },
+      };
     } catch (e: any) {
-      return { table: [] as any[], vars: [] as string[], err: e?.message ?? String(e), latex1: '', latex2: '' };
+      return {
+        vars: [] as string[],
+        err: e?.message ?? String(e),
+        latex1: '',
+        latex2: '',
+        totalRows: 0,
+        v1Bits: new Uint32Array(0),
+        v2Bits: new Uint32Array(0),
+        diffRows: new Uint32Array(0),
+        timings: { parseMs: 0, varsMs: 0, evalMs: 0, diffMs: 0, latexMs: 0 },
+      };
     }
   }, [expr1, expr2]);
 
-  const display = useMemo(() => (onlyDiff ? table.filter((r) => !r.same) : table), [table, onlyDiff]);
+  const displayCount = onlyDiff ? diffRows.length : totalRows;
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const rowVirtualizer = useWindowVirtualizer({
-    count: display.length,
+    count: displayCount,
     estimateSize: () => 35,
     overscan: 5,
     scrollMargin: listRef.current?.offsetTop ?? 0,
@@ -362,7 +464,10 @@ export default function App() {
               Parse error: {err}
             </div>
           ) : (
-            <div className="text-sm text-neutral-600">Variables: {vars.length ? vars.join(', ') : '—'}</div>
+            <div className="text-sm text-neutral-600 text-right">
+              <div>Variables: {vars.length ? vars.join(', ') : '—'}</div>
+              {!err && <div className="text-xs text-neutral-500">Compute: {(timings.evalMs + timings.diffMs).toFixed(2)}ms · Parse+prep: {(timings.parseMs + timings.varsMs).toFixed(2)}ms</div>}
+            </div>
           )}
         </section>
 
@@ -380,7 +485,7 @@ export default function App() {
             </div>
             {err ? (
               <div className="px-3 py-4 text-neutral-500">Fix the error to see the table.</div>
-            ) : display.length === 0 ? (
+            ) : displayCount === 0 ? (
               <div className="px-3 py-4 text-neutral-500">No rows to display.</div>
             ) : (
               <div
@@ -391,8 +496,11 @@ export default function App() {
                 }}
               >
                 {rowVirtualizer.getVirtualItems().map((item) => {
-                  const row = display[item.index];
-                  const rowClass = row.same ? 'bg-green-50' : 'bg-red-50';
+                  const rowIndex = onlyDiff ? diffRows[item.index] : item.index;
+                  const v1 = getBit(v1Bits, rowIndex);
+                  const v2 = getBit(v2Bits, rowIndex);
+                  const same = v1 === v2;
+                  const rowClass = same ? 'bg-green-50' : 'bg-red-50';
                   return (
                     <div
                       key={item.key}
@@ -407,11 +515,11 @@ export default function App() {
                         transform: `translateY(${item.start - rowVirtualizer.options.scrollMargin}px)`,
                       }}
                     >
-                      {vars.map((v) => (
-                        <div key={v} className="px-3 py-1.5 font-mono">{asBit(row.env[v])}</div>
+                      {vars.map((v, idx) => (
+                        <div key={v} className="px-3 py-1.5 font-mono">{asBit(getAssignmentBit(rowIndex, idx, vars.length))}</div>
                       ))}
-                      <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v1)}</div>
-                      <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v2)}</div>
+                      <div className={`px-3 py-1.5 font-mono ${same ? 'text-green-700' : 'text-red-700'}`}>{asBit(v1)}</div>
+                      <div className={`px-3 py-1.5 font-mono ${same ? 'text-green-700' : 'text-red-700'}`}>{asBit(v2)}</div>
                     </div>
                   );
                 })}
