@@ -25,11 +25,12 @@ function tokenize(srcRaw: string): Token[] {
   const src = normalizeInput(srcRaw);
   const tokens: Token[] = [];
   let i = 0;
-  const isLetter = (ch: string) => /[A-Za-z]/.test(ch);
-  const isVarRest = (ch: string) => /[0-9_]/.test(ch);
+  const isLetterCode = (code: number) => (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+  const isVarRestCode = (code: number) => (code >= 48 && code <= 57) || code === 95;
 
   while (i < src.length) {
     const ch = src[i];
+    const code = src.charCodeAt(i);
 
     if (ch === ' ') { i++; continue; }
 
@@ -48,9 +49,9 @@ function tokenize(srcRaw: string): Token[] {
     if (ch === '0') { tokens.push({ type: 'CONST', value: false }); i++; continue; }
 
     // Variable: single letter, optionally followed by digits/underscores
-    if (isLetter(ch)) {
+    if (isLetterCode(code)) {
       let j = i + 1;
-      while (j < src.length && isVarRest(src[j])) j++;
+      while (j < src.length && isVarRestCode(src.charCodeAt(j))) j++;
       const name = src.slice(i, j);
       tokens.push({ type: 'VAR', name });
       i = j;
@@ -224,18 +225,37 @@ function makeFilledBitset(totalRows: number, value: boolean): Uint32Array {
 
 function buildVariableBitsets(vars: string[], totalRows: number): Map<string, Uint32Array> {
   const byVar = new Map<string, Uint32Array>();
+  const words = Math.ceil(totalRows / 32);
   for (let v = 0; v < vars.length; v++) {
-    const bits = new Uint32Array(Math.ceil(totalRows / 32));
-    const block = 1 << (vars.length - 1 - v);
-    const cycle = block << 1;
-    for (let i = block; i < totalRows; i += cycle) {
-      const end = Math.min(i + block, totalRows);
-      for (let r = i; r < end; r++) {
-        bits[r >>> 5] |= 1 << (r & 31);
+    const bits = new Uint32Array(words);
+    const block = 2 ** (vars.length - 1 - v);
+
+    if (block >= 32) {
+      const onesWords = block >>> 5;
+      const cycleWords = onesWords << 1;
+      for (let start = 0; start < words; start += cycleWords) {
+        const onesStart = start + onesWords;
+        const onesEnd = Math.min(onesStart + onesWords, words);
+        if (onesStart < words) bits.fill(0xffffffff, onesStart, onesEnd);
       }
+    } else {
+      const cycle = block << 1;
+      let pattern = 0;
+      for (let bit = 0; bit < 32; bit++) {
+        if ((bit % cycle) >= block) pattern |= (1 << bit) >>> 0;
+      }
+      bits.fill(pattern >>> 0);
     }
+
     byVar.set(vars[v], bits);
   }
+
+  const tailBits = totalRows & 31;
+  if (tailBits !== 0 && words > 0) {
+    const tailMask = ((1 << tailBits) - 1) >>> 0;
+    for (const bits of byVar.values()) bits[words - 1] &= tailMask;
+  }
+
   return byVar;
 }
 
