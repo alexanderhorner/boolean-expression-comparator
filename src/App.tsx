@@ -210,30 +210,89 @@ function astToLatex(node: ASTNode, parentPrec = 0): string {
   }
 }
 
-function evalRPN(rpn: Token[], env: Record<string, boolean>): boolean {
-  const st: boolean[] = [];
-  for (const t of rpn) {
-    if (t.type === 'CONST') st.push(t.value);
-    else if (t.type === 'VAR') {
-      if (!(t.name in env)) throw new Error(`Variable '${t.name}' is undefined`);
-      st.push(env[t.name]);
-    } else if (t.type === 'OP') {
-      if (t.op === 'NOT') {
-        if (st.length < 1) throw new Error('NOT missing operand');
-        const a = st.pop()!;
-        st.push(!a);
-      } else {
-        if (st.length < 2) throw new Error(`${t.op} missing operand`);
-        const b = st.pop()!;
-        const a = st.pop()!;
-        if (t.op === 'AND') st.push(a && b);
-        else if (t.op === 'OR') st.push(a || b);
-        else if (t.op === 'XOR') st.push(a !== b);
+function makeFilledBitset(totalRows: number, value: boolean): Uint32Array {
+  const words = Math.ceil(totalRows / 32);
+  const out = new Uint32Array(words);
+  if (!value || words === 0) return out;
+  out.fill(0xffffffff);
+  const tailBits = totalRows & 31;
+  if (tailBits !== 0) {
+    out[words - 1] = (1 << tailBits) - 1;
+  }
+  return out;
+}
+
+function buildVariableBitsets(vars: string[], totalRows: number): Map<string, Uint32Array> {
+  const byVar = new Map<string, Uint32Array>();
+  for (let v = 0; v < vars.length; v++) {
+    const bits = new Uint32Array(Math.ceil(totalRows / 32));
+    const block = 1 << (vars.length - 1 - v);
+    const cycle = block << 1;
+    for (let i = block; i < totalRows; i += cycle) {
+      const end = Math.min(i + block, totalRows);
+      for (let r = i; r < end; r++) {
+        bits[r >>> 5] |= 1 << (r & 31);
       }
     }
+    byVar.set(vars[v], bits);
   }
-  if (st.length !== 1) throw new Error('Invalid expression');
-  return st[0];
+  return byVar;
+}
+
+function evalRPNBitset(rpn: Token[], vars: Map<string, Uint32Array>, totalRows: number): Uint32Array {
+  const stack: Uint32Array[] = [];
+  const words = Math.ceil(totalRows / 32);
+  const allTrue = makeFilledBitset(totalRows, true);
+  const allFalse = new Uint32Array(words);
+  const tailBits = totalRows & 31;
+  const tailMask = tailBits === 0 ? 0xffffffff : (1 << tailBits) - 1;
+
+  for (const t of rpn) {
+    if (t.type === 'VAR') {
+      const col = vars.get(t.name);
+      if (!col) throw new Error(`Unknown variable ${t.name}`);
+      stack.push(col);
+      continue;
+    }
+    if (t.type === 'CONST') {
+      stack.push(t.value ? allTrue : allFalse);
+      continue;
+    }
+    if (t.type !== 'OP') continue;
+    if (t.op === 'NOT') {
+      if (stack.length < 1) throw new Error('NOT missing operand');
+      const a = stack.pop()!;
+      const out = new Uint32Array(words);
+      for (let i = 0; i < words; i++) out[i] = ~a[i];
+      if (words > 0) out[words - 1] &= tailMask;
+      stack.push(out);
+      continue;
+    }
+
+    if (stack.length < 2) throw new Error(`${t.op} missing operand`);
+    const b = stack.pop()!;
+    const a = stack.pop()!;
+    const out = new Uint32Array(words);
+    if (t.op === 'AND') {
+      for (let i = 0; i < words; i++) out[i] = a[i] & b[i];
+    } else if (t.op === 'OR') {
+      for (let i = 0; i < words; i++) out[i] = a[i] | b[i];
+    } else {
+      for (let i = 0; i < words; i++) out[i] = a[i] ^ b[i];
+    }
+    stack.push(out);
+  }
+
+  if (stack.length !== 1) throw new Error('Invalid expression');
+  return stack[0];
+}
+
+function getBit(bits: Uint32Array, row: number): boolean {
+  return ((bits[row >>> 5] >>> (row & 31)) & 1) === 1;
+}
+
+function getAssignmentBit(row: number, varPosition: number, varCount: number): boolean {
+  return ((row >>> (varCount - 1 - varPosition)) & 1) === 1;
 }
 
 function extractVars(tokens: Token[]): string[] {
@@ -250,21 +309,6 @@ function compile(expr: string) {
   return { rpn, vars, ast };
 }
 
-function allAssignments(vars: string[]): Record<string, boolean>[] {
-  const n = vars.length;
-  const out: Record<string, boolean>[] = [];
-  const total = Math.max(1, 1 << n);
-  for (let i = 0; i < total; i++) {
-    const row: Record<string, boolean> = {};
-    for (let v = 0; v < n; v++) {
-      const bit = (i >> (n - 1 - v)) & 1;
-      row[vars[v]] = !!bit;
-    }
-    out.push(row);
-  }
-  return out;
-}
-
 function asBit(b: boolean): 0 | 1 { return b ? 1 : 0; }
 
 export default function App() {
@@ -277,11 +321,14 @@ export default function App() {
       const c1 = compile(expr1);
       const c2 = compile(expr2);
       const allVars = Array.from(new Set([...c1.vars, ...c2.vars])).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-      const rows = allAssignments(allVars);
-      const data = rows.map((env) => {
-        const v1 = evalRPN(c1.rpn, env);
-        const v2 = evalRPN(c2.rpn, env);
-        return { env, v1, v2, same: v1 === v2 };
+      const totalRows = Math.max(1, 2 ** allVars.length);
+      const varBitsets = buildVariableBitsets(allVars, totalRows);
+      const v1Bits = evalRPNBitset(c1.rpn, varBitsets, totalRows);
+      const v2Bits = evalRPNBitset(c2.rpn, varBitsets, totalRows);
+      const data = Array.from({ length: totalRows }, (_, row) => {
+        const v1 = getBit(v1Bits, row);
+        const v2 = getBit(v2Bits, row);
+        return { row, v1, v2, same: v1 === v2 };
       });
       const latex1 = katex.renderToString(astToLatex(c1.ast), { throwOnError: false });
       const latex2 = katex.renderToString(astToLatex(c2.ast), { throwOnError: false });
@@ -407,8 +454,8 @@ export default function App() {
                         transform: `translateY(${item.start - rowVirtualizer.options.scrollMargin}px)`,
                       }}
                     >
-                      {vars.map((v) => (
-                        <div key={v} className="px-3 py-1.5 font-mono">{asBit(row.env[v])}</div>
+                      {vars.map((v, idx) => (
+                        <div key={v} className="px-3 py-1.5 font-mono">{asBit(getAssignmentBit(row.row, idx, vars.length))}</div>
                       ))}
                       <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v1)}</div>
                       <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v2)}</div>
