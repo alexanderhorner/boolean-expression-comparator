@@ -98,38 +98,33 @@ function extractVars(tokens: Token[]): string[] {
   return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
 }
 
-function buildVariableBitsets(vars: string[], totalRows: number): Map<string, Uint32Array> {
-  const byVar = new Map<string, Uint32Array>();
+function buildVariableBitsetForPosition(varPosition: number, varCount: number, totalRows: number): Uint32Array {
   const words = Math.ceil(totalRows / 32);
-  for (let v = 0; v < vars.length; v++) {
-    const bits = new Uint32Array(words);
-    const block = 2 ** (vars.length - 1 - v);
+  const bits = new Uint32Array(words);
+  const block = 2 ** (varCount - 1 - varPosition);
 
-    if (block >= 32) {
-      const onesWords = block >>> 5;
-      const cycleWords = onesWords << 1;
-      for (let start = 0; start < words; start += cycleWords) {
-        const onesStart = start + onesWords;
-        const onesEnd = Math.min(onesStart + onesWords, words);
-        if (onesStart < words) bits.fill(0xffffffff, onesStart, onesEnd);
-      }
-    } else {
-      const cycle = block << 1;
-      let pattern = 0;
-      for (let bit = 0; bit < 32; bit++) if ((bit % cycle) >= block) pattern |= (1 << bit) >>> 0;
-      bits.fill(pattern >>> 0);
+  if (block >= 32) {
+    const onesWords = block >>> 5;
+    const cycleWords = onesWords << 1;
+    for (let start = 0; start < words; start += cycleWords) {
+      const onesStart = start + onesWords;
+      const onesEnd = Math.min(onesStart + onesWords, words);
+      if (onesStart < words) bits.fill(0xffffffff, onesStart, onesEnd);
     }
-
-    byVar.set(vars[v], bits);
+  } else {
+    const cycle = block << 1;
+    let pattern = 0;
+    for (let bit = 0; bit < 32; bit++) if ((bit % cycle) >= block) pattern |= (1 << bit) >>> 0;
+    bits.fill(pattern >>> 0);
   }
 
   const tailBits = totalRows & 31;
   if (tailBits !== 0 && words > 0) {
     const tailMask = ((1 << tailBits) - 1) >>> 0;
-    for (const bits of byVar.values()) bits[words - 1] &= tailMask;
+    bits[words - 1] &= tailMask;
   }
 
-  return byVar;
+  return bits;
 }
 
 function makeFilledBitset(totalRows: number, value: boolean): Uint32Array {
@@ -142,7 +137,7 @@ function makeFilledBitset(totalRows: number, value: boolean): Uint32Array {
   return out;
 }
 
-function evalRPNBitset(rpn: Token[], vars: Map<string, Uint32Array>, totalRows: number): Uint32Array {
+function evalRPNBitset(rpn: Token[], varIndex: Map<string, number>, varCount: number, totalRows: number): Uint32Array {
   const stack: Uint32Array[] = [];
   const words = Math.ceil(totalRows / 32);
   const allTrue = makeFilledBitset(totalRows, true);
@@ -152,9 +147,9 @@ function evalRPNBitset(rpn: Token[], vars: Map<string, Uint32Array>, totalRows: 
 
   for (const t of rpn) {
     if (t.type === 'VAR') {
-      const col = vars.get(t.name);
-      if (!col) throw new Error(`Unknown variable ${t.name}`);
-      stack.push(col);
+      const idx = varIndex.get(t.name);
+      if (idx === undefined) throw new Error(`Unknown variable ${t.name}`);
+      stack.push(buildVariableBitsetForPosition(idx, varCount, totalRows));
       continue;
     }
     if (t.type === 'CONST') { stack.push(t.value ? allTrue : allFalse); continue; }
@@ -223,7 +218,6 @@ type WorkerResponse = {
 
 const cache = new Map<string, Omit<WorkerResponse, 'id'>>();
 
-const MAX_VARIABLES = 25;
 const CACHE_LIMIT = 8;
 
 
@@ -250,17 +244,15 @@ self.onmessage = (evt: MessageEvent<WorkerRequest>) => {
     const c1Rpn = toRPN(c1Tokens);
     const c2Rpn = toRPN(c2Tokens);
     const vars = Array.from(new Set([...extractVars(c1Tokens), ...extractVars(c2Tokens)])).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-    if (vars.length > MAX_VARIABLES) {
-      throw new Error(`Too many variables (${vars.length}). Maximum supported is ${MAX_VARIABLES} to prevent browser crashes.`);
-    }
     const t1 = performance.now();
 
     const totalRows = Math.max(1, 2 ** vars.length);
-    const varBitsets = buildVariableBitsets(vars, totalRows);
+    const varIndex = new Map<string, number>();
+    for (let i = 0; i < vars.length; i++) varIndex.set(vars[i], i);
     const t2 = performance.now();
 
-    const v1Bits = evalRPNBitset(c1Rpn, varBitsets, totalRows);
-    const v2Bits = evalRPNBitset(c2Rpn, varBitsets, totalRows);
+    const v1Bits = evalRPNBitset(c1Rpn, varIndex, vars.length, totalRows);
+    const v2Bits = evalRPNBitset(c2Rpn, varIndex, vars.length, totalRows);
     const t3 = performance.now();
 
     const diffBits = new Uint32Array(v1Bits.length);
