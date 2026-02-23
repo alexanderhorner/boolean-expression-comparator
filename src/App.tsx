@@ -1,6 +1,6 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import katex from 'katex';
-import { useWindowVirtualizer } from '@tanstack/react-virtual';
+import { useVirtualizer } from '@tanstack/react-virtual';
 
 type Op = 'AND' | 'OR' | 'XOR' | 'NOT';
 
@@ -14,6 +14,19 @@ type Token =
 
 const unicodeApos = /[\u2018\u2019\u02BC\u2032]/g; // ‘ ’ ʻ ′
 
+
+type WorkerResult = {
+  vars: string[];
+  totalRows: number;
+  v1Bits: Uint32Array;
+  v2Bits: Uint32Array;
+  diffRows: Uint32Array;
+  timings: { parseMs: number; prepMs: number; evalMs: number; diffMs: number; totalMs: number };
+  diffCount: number;
+  err: string | null;
+};
+
+
 function normalizeInput(s: string): string {
   return s
     .replace(unicodeApos, "'")
@@ -25,11 +38,12 @@ function tokenize(srcRaw: string): Token[] {
   const src = normalizeInput(srcRaw);
   const tokens: Token[] = [];
   let i = 0;
-  const isLetter = (ch: string) => /[A-Za-z]/.test(ch);
-  const isVarRest = (ch: string) => /[0-9_]/.test(ch);
+  const isLetterCode = (code: number) => (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+  const isVarRestCode = (code: number) => (code >= 48 && code <= 57) || code === 95;
 
   while (i < src.length) {
     const ch = src[i];
+    const code = src.charCodeAt(i);
 
     if (ch === ' ') { i++; continue; }
 
@@ -48,9 +62,9 @@ function tokenize(srcRaw: string): Token[] {
     if (ch === '0') { tokens.push({ type: 'CONST', value: false }); i++; continue; }
 
     // Variable: single letter, optionally followed by digits/underscores
-    if (isLetter(ch)) {
+    if (isLetterCode(code)) {
       let j = i + 1;
-      while (j < src.length && isVarRest(src[j])) j++;
+      while (j < src.length && isVarRestCode(src.charCodeAt(j))) j++;
       const name = src.slice(i, j);
       tokens.push({ type: 'VAR', name });
       i = j;
@@ -210,31 +224,19 @@ function astToLatex(node: ASTNode, parentPrec = 0): string {
   }
 }
 
-function evalRPN(rpn: Token[], env: Record<string, boolean>): boolean {
-  const st: boolean[] = [];
-  for (const t of rpn) {
-    if (t.type === 'CONST') st.push(t.value);
-    else if (t.type === 'VAR') {
-      if (!(t.name in env)) throw new Error(`Variable '${t.name}' is undefined`);
-      st.push(env[t.name]);
-    } else if (t.type === 'OP') {
-      if (t.op === 'NOT') {
-        if (st.length < 1) throw new Error('NOT missing operand');
-        const a = st.pop()!;
-        st.push(!a);
-      } else {
-        if (st.length < 2) throw new Error(`${t.op} missing operand`);
-        const b = st.pop()!;
-        const a = st.pop()!;
-        if (t.op === 'AND') st.push(a && b);
-        else if (t.op === 'OR') st.push(a || b);
-        else if (t.op === 'XOR') st.push(a !== b);
-      }
-    }
-  }
-  if (st.length !== 1) throw new Error('Invalid expression');
-  return st[0];
+
+
+
+function getBit(bits: Uint32Array, row: number): boolean {
+  return ((bits[row >>> 5] >>> (row & 31)) & 1) === 1;
 }
+
+function getAssignmentBit(row: number, varPosition: number, varCount: number): boolean {
+  return ((row >>> (varCount - 1 - varPosition)) & 1) === 1;
+}
+
+
+
 
 function extractVars(tokens: Token[]): string[] {
   const set = new Set<string>();
@@ -250,21 +252,6 @@ function compile(expr: string) {
   return { rpn, vars, ast };
 }
 
-function allAssignments(vars: string[]): Record<string, boolean>[] {
-  const n = vars.length;
-  const out: Record<string, boolean>[] = [];
-  const total = Math.max(1, 1 << n);
-  for (let i = 0; i < total; i++) {
-    const row: Record<string, boolean> = {};
-    for (let v = 0; v < n; v++) {
-      const bit = (i >> (n - 1 - v)) & 1;
-      row[vars[v]] = !!bit;
-    }
-    out.push(row);
-  }
-  return out;
-}
-
 function asBit(b: boolean): 0 | 1 { return b ? 1 : 0; }
 
 export default function App() {
@@ -272,33 +259,79 @@ export default function App() {
   const [expr2, setExpr2] = useState<string>("A‘*B");
   const [onlyDiff, setOnlyDiff] = useState(false);
 
-  const { table, vars, err, latex1, latex2 } = useMemo(() => {
+
+  const [workerData, setWorkerData] = useState<WorkerResult>({
+    vars: [],
+    totalRows: 0,
+    v1Bits: new Uint32Array(0),
+    v2Bits: new Uint32Array(0),
+    diffRows: new Uint32Array(0),
+    timings: { parseMs: 0, prepMs: 0, evalMs: 0, diffMs: 0, totalMs: 0 },
+    diffCount: 0,
+    err: null,
+  });
+  const [isComputing, setIsComputing] = useState(false);
+  const workerRef = useRef<Worker | null>(null);
+  const requestIdRef = useRef(0);
+
+  useEffect(() => {
+    const worker = new Worker(new URL('./truthTable.worker.ts', import.meta.url), { type: 'module' });
+    workerRef.current = worker;
+    worker.onmessage = (evt: MessageEvent<WorkerResult & { id: number }>) => {
+      if (evt.data.id !== requestIdRef.current) return;
+      setWorkerData({
+        vars: evt.data.vars,
+        totalRows: evt.data.totalRows,
+        v1Bits: evt.data.v1Bits,
+        v2Bits: evt.data.v2Bits,
+        diffRows: evt.data.diffRows,
+        timings: evt.data.timings,
+        diffCount: evt.data.diffCount,
+        err: evt.data.err,
+      });
+      setIsComputing(false);
+    };
+    return () => worker.terminate();
+  }, []);
+
+  useEffect(() => {
+    const worker = workerRef.current;
+    if (!worker) return;
+    requestIdRef.current += 1;
+    setIsComputing(true);
+    worker.postMessage({ id: requestIdRef.current, expr1, expr2, needDiffRows: onlyDiff });
+  }, [expr1, expr2, onlyDiff]);
+
+  const { latex1, latex2, latexErr, latexMs } = useMemo(() => {
+    const t0 = performance.now();
     try {
       const c1 = compile(expr1);
       const c2 = compile(expr2);
-      const allVars = Array.from(new Set([...c1.vars, ...c2.vars])).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-      const rows = allAssignments(allVars);
-      const data = rows.map((env) => {
-        const v1 = evalRPN(c1.rpn, env);
-        const v2 = evalRPN(c2.rpn, env);
-        return { env, v1, v2, same: v1 === v2 };
-      });
-      const latex1 = katex.renderToString(astToLatex(c1.ast), { throwOnError: false });
-      const latex2 = katex.renderToString(astToLatex(c2.ast), { throwOnError: false });
-      return { table: data, vars: allVars, err: null as string | null, latex1, latex2 };
+      return {
+        latex1: katex.renderToString(astToLatex(c1.ast), { throwOnError: false }),
+        latex2: katex.renderToString(astToLatex(c2.ast), { throwOnError: false }),
+        latexErr: null as string | null,
+        latexMs: performance.now() - t0,
+      };
     } catch (e: any) {
-      return { table: [] as any[], vars: [] as string[], err: e?.message ?? String(e), latex1: '', latex2: '' };
+      return { latex1: '', latex2: '', latexErr: e?.message ?? String(e), latexMs: performance.now() - t0 };
     }
   }, [expr1, expr2]);
 
-  const display = useMemo(() => (onlyDiff ? table.filter((r) => !r.same) : table), [table, onlyDiff]);
+  const vars = workerData.vars;
+  const totalRows = workerData.totalRows;
+  const v1Bits = workerData.v1Bits;
+  const v2Bits = workerData.v2Bits;
+  const diffRows = workerData.diffRows;
+  const err = workerData.err ?? latexErr;
+  const displayCount = onlyDiff ? workerData.diffCount : totalRows;
 
   const listRef = useRef<HTMLDivElement | null>(null);
-  const rowVirtualizer = useWindowVirtualizer({
-    count: display.length,
+  const rowVirtualizer = useVirtualizer({
+    count: displayCount,
+    getScrollElement: () => listRef.current,
     estimateSize: () => 35,
-    overscan: 5,
-    scrollMargin: listRef.current?.offsetTop ?? 0,
+    overscan: 8,
   });
   const gridTemplate = useMemo(
     () => `repeat(${vars.length + 2}, minmax(0,1fr))`,
@@ -362,11 +395,14 @@ export default function App() {
               Parse error: {err}
             </div>
           ) : (
-            <div className="text-sm text-neutral-600">Variables: {vars.length ? vars.join(', ') : '—'}</div>
+            <div className="text-sm text-neutral-600 text-right">
+              <div>Variables: {vars.length ? vars.join(', ') : '—'}</div>
+              {!err && <div className="text-xs text-neutral-500">Worker: {workerData.timings.totalMs.toFixed(2)}ms (parse {workerData.timings.parseMs.toFixed(2)} · prep {workerData.timings.prepMs.toFixed(2)} · eval {workerData.timings.evalMs.toFixed(2)}) · Diff rows: {workerData.diffCount.toLocaleString()} · KaTeX: {latexMs.toFixed(2)}ms{isComputing ? " · computing…" : ""}</div>}
+            </div>
           )}
         </section>
 
-        <div ref={listRef} className="bg-white rounded-2xl overflow-hidden shadow-sm border border-neutral-200">
+        <div ref={listRef} className="bg-white rounded-2xl overflow-auto shadow-sm border border-neutral-200 h-[70vh]">
           <div className="min-w-full text-sm">
             <div
               className="bg-neutral-100 text-neutral-700 sticky top-0 grid"
@@ -380,7 +416,7 @@ export default function App() {
             </div>
             {err ? (
               <div className="px-3 py-4 text-neutral-500">Fix the error to see the table.</div>
-            ) : display.length === 0 ? (
+            ) : displayCount === 0 ? (
               <div className="px-3 py-4 text-neutral-500">No rows to display.</div>
             ) : (
               <div
@@ -391,8 +427,11 @@ export default function App() {
                 }}
               >
                 {rowVirtualizer.getVirtualItems().map((item) => {
-                  const row = display[item.index];
-                  const rowClass = row.same ? 'bg-green-50' : 'bg-red-50';
+                  const rowIndex = onlyDiff ? diffRows[item.index] : item.index;
+                  const v1 = getBit(v1Bits, rowIndex);
+                  const v2 = getBit(v2Bits, rowIndex);
+                  const same = v1 === v2;
+                  const rowClass = same ? 'bg-green-50' : 'bg-red-50';
                   return (
                     <div
                       key={item.key}
@@ -404,14 +443,14 @@ export default function App() {
                         left: 0,
                         width: '100%',
                         height: `${item.size}px`,
-                        transform: `translateY(${item.start - rowVirtualizer.options.scrollMargin}px)`,
+                        transform: `translateY(${item.start}px)`,
                       }}
                     >
-                      {vars.map((v) => (
-                        <div key={v} className="px-3 py-1.5 font-mono">{asBit(row.env[v])}</div>
+                      {vars.map((v, idx) => (
+                        <div key={v} className="px-3 py-1.5 font-mono">{asBit(getAssignmentBit(rowIndex, idx, vars.length))}</div>
                       ))}
-                      <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v1)}</div>
-                      <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v2)}</div>
+                      <div className={`px-3 py-1.5 font-mono ${same ? 'text-green-700' : 'text-red-700'}`}>{asBit(v1)}</div>
+                      <div className={`px-3 py-1.5 font-mono ${same ? 'text-green-700' : 'text-red-700'}`}>{asBit(v2)}</div>
                     </div>
                   );
                 })}
