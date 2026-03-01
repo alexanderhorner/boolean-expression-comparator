@@ -1,5 +1,6 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef } from 'react';
 import katex from 'katex';
+import { useVirtualizer } from '@tanstack/react-virtual';
 
 type Op = 'AND' | 'OR' | 'XOR' | 'NOT';
 
@@ -268,10 +269,12 @@ export default function App() {
   const [expr2, setExpr2] = useState<string>("A‘*B");
   const [onlyDiff, setOnlyDiff] = useState(false);
 
-  const [windowStart, setWindowStart] = useState<bigint>(0n);
-  const pageSize = 32;
+  const maxScrollableRows = 1000;
+  const rowHeight = 35;
+  const scrollParentRef = useRef<HTMLDivElement | null>(null);
+  const [rowBaseStart, setRowBaseStart] = useState<bigint>(0n);
 
-  const { vars, err, latex1, latex2, totalRows, getDisplayRows, onlyDiffWarning } = useMemo(() => {
+  const { vars, err, latex1, latex2, totalRows, evalRow } = useMemo(() => {
     try {
       const c1 = compile(expr1);
       const c2 = compile(expr2);
@@ -294,36 +297,7 @@ export default function App() {
         return result;
       };
 
-      const getDisplayRows = (start: bigint, count: number) => {
-        const rows: Array<{ row: bigint; v1: boolean; v2: boolean; same: boolean }> = [];
-        if (!onlyDiff) {
-          for (let i = 0; i < count; i++) {
-            const row = start + BigInt(i);
-            if (row >= totalRows) break;
-            rows.push(evalRow(row));
-          }
-          return rows;
-        }
-
-        const scanLimit = 10000;
-        let cursor = start;
-        let scanned = 0;
-        while (rows.length < count && cursor < totalRows && scanned < scanLimit) {
-          const result = evalRow(cursor);
-          if (!result.same) rows.push(result);
-          cursor += 1n;
-          scanned++;
-        }
-
-        return rows;
-      };
-
-      const onlyDiffWarning =
-        onlyDiff && allVars.length > 20
-          ? 'Only-differences mode now scans incrementally from the current starting row for speed on very large variable sets.'
-          : null;
-
-      return { vars: allVars, err: null as string | null, latex1, latex2, totalRows, getDisplayRows, onlyDiffWarning };
+      return { vars: allVars, err: null as string | null, latex1, latex2, totalRows, evalRow };
     } catch (e: any) {
       return {
         vars: [] as string[],
@@ -331,33 +305,83 @@ export default function App() {
         latex1: '',
         latex2: '',
         totalRows: 0n,
-        getDisplayRows: (_start: bigint, _count: number) => [] as Array<{ row: bigint; v1: boolean; v2: boolean; same: boolean }>,
-        onlyDiffWarning: null as string | null,
+        evalRow: (_row: bigint) => ({ row: 0n, v1: false, v2: false, same: true }),
       };
     }
-  }, [expr1, expr2, onlyDiff]);
-  const visibleRows = useMemo(() => getDisplayRows(windowStart, pageSize), [getDisplayRows, windowStart]);
+  }, [expr1, expr2]);
+
+  const diffStateRef = useRef<{ baseStart: bigint; rows: Array<{ row: bigint; v1: boolean; v2: boolean; same: boolean }>; cursor: bigint; exhausted: boolean }>({
+    baseStart: 0n,
+    rows: [],
+    cursor: 0n,
+    exhausted: false,
+  });
 
   useEffect(() => {
-    setWindowStart(0n);
+    setRowBaseStart(0n);
   }, [expr1, expr2, onlyDiff]);
 
   useEffect(() => {
-    const maxAllowedStart = totalRows > BigInt(pageSize) ? totalRows - BigInt(pageSize) : 0n;
-    if (windowStart > maxAllowedStart) {
-      setWindowStart(maxAllowedStart);
+    const maxAllowedStart = totalRows > BigInt(maxScrollableRows) ? totalRows - BigInt(maxScrollableRows) : 0n;
+    if (rowBaseStart > maxAllowedStart) {
+      setRowBaseStart(maxAllowedStart);
     }
-  }, [windowStart, totalRows]);
+  }, [rowBaseStart, totalRows]);
 
-  const maxStart = totalRows > BigInt(pageSize) ? totalRows - BigInt(pageSize) : 0n;
-  const startLabel = windowStart.toString();
+  useEffect(() => {
+    diffStateRef.current = {
+      baseStart: rowBaseStart,
+      rows: [],
+      cursor: rowBaseStart,
+      exhausted: false,
+    };
+  }, [rowBaseStart, onlyDiff, expr1, expr2]);
 
-  const shiftWindow = (delta: number) => {
-    const next = windowStart + BigInt(delta);
-    if (next < 0n) setWindowStart(0n);
-    else if (next > maxStart) setWindowStart(maxStart);
-    else setWindowStart(next);
+  const ensureDifferingRow = (index: number) => {
+    const state = diffStateRef.current;
+    if (!onlyDiff) return null;
+    if (state.baseStart !== rowBaseStart) {
+      state.baseStart = rowBaseStart;
+      state.rows = [];
+      state.cursor = rowBaseStart;
+      state.exhausted = false;
+    }
+
+    while (state.rows.length <= index && !state.exhausted && state.rows.length < maxScrollableRows) {
+      if (state.cursor >= totalRows) {
+        state.exhausted = true;
+        break;
+      }
+      const result = evalRow(state.cursor);
+      state.cursor += 1n;
+      if (!result.same) {
+        state.rows.push(result);
+      }
+    }
+
+    return state.rows[index] ?? null;
   };
+
+  const maxStart = totalRows > BigInt(maxScrollableRows) ? totalRows - BigInt(maxScrollableRows) : 0n;
+  const displayCount = onlyDiff
+    ? (diffStateRef.current.exhausted ? diffStateRef.current.rows.length : maxScrollableRows)
+    : Number(totalRows - rowBaseStart > BigInt(maxScrollableRows) ? BigInt(maxScrollableRows) : totalRows - rowBaseStart);
+
+  const rowVirtualizer = useVirtualizer({
+    count: displayCount,
+    getScrollElement: () => scrollParentRef.current,
+    estimateSize: () => rowHeight,
+    overscan: 8,
+  });
+
+  const shiftRange = (delta: number) => {
+    const next = rowBaseStart + BigInt(delta);
+    if (next < 0n) setRowBaseStart(0n);
+    else if (next > maxStart) setRowBaseStart(maxStart);
+    else setRowBaseStart(next);
+    if (scrollParentRef.current) scrollParentRef.current.scrollTop = 0;
+  };
+
   const gridTemplate = useMemo(
     () => `repeat(${vars.length + 2}, minmax(0,1fr))`,
     [vars.length]
@@ -426,31 +450,31 @@ export default function App() {
 
         <section className="flex items-center justify-between mb-3 gap-3">
           <div className="text-sm text-neutral-600">
-            Showing up to {pageSize} rows starting at index <span className="font-mono">{startLabel}</span> (of {totalRows.toString()} total)
+            Infinite scroll window: up to {maxScrollableRows} rows from <span className="font-mono">{rowBaseStart.toString()}</span> (of {totalRows.toString()} total)
           </div>
           <div className="flex items-center gap-2">
             <button
               type="button"
               className="px-3 py-1.5 rounded-lg border border-neutral-300 text-sm disabled:opacity-40"
-              onClick={() => shiftWindow(-pageSize)}
-              disabled={windowStart === 0n}
+              onClick={() => shiftRange(-maxScrollableRows)}
+              disabled={rowBaseStart === 0n}
             >
-              Previous
+              Previous 1000
             </button>
             <button
               type="button"
               className="px-3 py-1.5 rounded-lg border border-neutral-300 text-sm disabled:opacity-40"
-              onClick={() => shiftWindow(pageSize)}
-              disabled={windowStart >= maxStart}
+              onClick={() => shiftRange(maxScrollableRows)}
+              disabled={rowBaseStart >= maxStart}
             >
-              Next
+              Next 1000
             </button>
           </div>
         </section>
 
-        {onlyDiffWarning && (
+        {onlyDiff && (
           <div className="mb-3 text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
-            {onlyDiffWarning}
+            Difference rows are discovered lazily while you scroll, so the app avoids scanning the full truth table up front.
           </div>
         )}
 
@@ -468,26 +492,48 @@ export default function App() {
             </div>
             {err ? (
               <div className="px-3 py-4 text-neutral-500">Fix the error to see the table.</div>
-            ) : visibleRows.length === 0 ? (
+            ) : displayCount === 0 ? (
               <div className="px-3 py-4 text-neutral-500">No rows to display.</div>
             ) : (
-              <div>
-                {visibleRows.map((row, i) => {
-                  const rowClass = row.same ? 'bg-green-50' : 'bg-red-50';
-                  return (
-                    <div
-                      key={`${row.row}-${i}`}
-                      className={`grid ${rowClass}`}
-                      style={{ gridTemplateColumns: gridTemplate }}
-                    >
-                      {vars.map((v, idx) => (
-                        <div key={v} className="px-3 py-1.5 font-mono">{asBit(getAssignmentBit(row.row, idx, vars.length))}</div>
-                      ))}
-                      <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v1)}</div>
-                      <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v2)}</div>
-                    </div>
-                  );
-                })}
+              <div ref={scrollParentRef} className="h-[65vh] overflow-auto relative">
+                <div
+                  style={{
+                    height: `${rowVirtualizer.getTotalSize()}px`,
+                    width: '100%',
+                    position: 'relative',
+                  }}
+                >
+                  {rowVirtualizer.getVirtualItems().map((item) => {
+                    const row = onlyDiff
+                      ? ensureDifferingRow(item.index)
+                      : evalRow(rowBaseStart + BigInt(item.index));
+
+                    if (!row) return null;
+
+                    const rowClass = row.same ? 'bg-green-50' : 'bg-red-50';
+                    return (
+                      <div
+                        key={item.key}
+                        className={`grid ${rowClass}`}
+                        style={{
+                          gridTemplateColumns: gridTemplate,
+                          position: 'absolute',
+                          top: 0,
+                          left: 0,
+                          width: '100%',
+                          height: `${item.size}px`,
+                          transform: `translateY(${item.start}px)`,
+                        }}
+                      >
+                        {vars.map((v, idx) => (
+                          <div key={v} className="px-3 py-1.5 font-mono">{asBit(getAssignmentBit(row.row, idx, vars.length))}</div>
+                        ))}
+                        <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v1)}</div>
+                        <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v2)}</div>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
             )}
           </div>
