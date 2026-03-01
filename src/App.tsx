@@ -382,30 +382,25 @@ export default function App() {
         </header>
 
         <section className="space-y-4 mb-4">
-          <div className="flex justify-between items-center">
-            <h2 className="text-sm font-medium text-neutral-700">Expressions</h2>
-            <button
-              type="button"
-              onClick={addExpression}
-              className="text-sm px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700"
-            >
-              + Add expression
-            </button>
-          </div>
+          <h2 className="text-sm font-semibold text-neutral-700">Expressions</h2>
           <div className="grid md:grid-cols-2 gap-4">
             {expressions.map((expr, index) => {
               const compiled = compiledExpressions.find((item) => item.id === expr.id);
               return (
-                <div key={expr.id} className="bg-white rounded-2xl shadow-sm p-4 border border-neutral-200">
+                <div key={expr.id} className="bg-white rounded-2xl shadow-sm p-4 border border-neutral-200 transition hover:shadow-md">
                   <div className="flex items-center justify-between mb-2">
                     <label className="block text-sm font-medium">Expression {index + 1}</label>
                     <button
                       type="button"
                       onClick={() => removeExpression(expr.id)}
                       disabled={expressions.length === 1}
-                      className="text-xs px-2 py-1 rounded border border-neutral-300 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-neutral-100"
+                      className="inline-flex items-center justify-center h-8 w-8 rounded-lg border border-neutral-300 text-neutral-600 hover:text-red-600 hover:border-red-300 hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:text-neutral-600 disabled:hover:border-neutral-300 disabled:hover:bg-transparent"
+                      title="Remove expression"
+                      aria-label={`Remove expression ${index + 1}`}
                     >
-                      Remove
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" className="h-4 w-4" aria-hidden="true">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M14.74 9l-.35 9m-4.78 0L9.26 9m9.97-3.21c.34.05.68.1 1.02.16m-1.02-.16L18.16 19.67A2.25 2.25 0 0115.91 21.75H8.09a2.25 2.25 0 01-2.24-2.08L4.77 5.79m14.46 0a48.108 48.108 0 00-3.48-.4m-12 0c.34-.06.68-.11 1.02-.16m0 0a48.11 48.11 0 013.48-.4m7.5 0V4.88c0-1.18-.91-2.17-2.09-2.21a51.964 51.964 0 00-3.82 0C8.66 2.71 7.75 3.7 7.75 4.88v.51m7.5 0a48.667 48.667 0 00-7.5 0" />
+                      </svg>
                     </button>
                   </div>
                   <input
@@ -420,6 +415,18 @@ export default function App() {
                 </div>
               );
             })}
+          </div>
+          <div>
+            <button
+              type="button"
+              onClick={addExpression}
+              className="inline-flex items-center gap-2 text-sm font-medium px-3 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 shadow-sm"
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="h-4 w-4" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" />
+              </svg>
+              Add expression
+            </button>
           </div>
         </section>
 
