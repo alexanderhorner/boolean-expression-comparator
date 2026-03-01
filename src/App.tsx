@@ -18,11 +18,10 @@ const unicodeApos = /[\u2018\u2019\u02BC\u2032]/g; // ‘ ’ ʻ ′
 type WorkerResult = {
   vars: string[];
   totalRows: number;
-  v1Bits: Uint32Array;
-  v2Bits: Uint32Array;
-  diffRows: Uint32Array;
+  startRow: number;
+  rows: Uint8Array;
   timings: { parseMs: number; prepMs: number; evalMs: number; diffMs: number; totalMs: number };
-  diffCount: number;
+  diffCount: number | null;
   err: string | null;
 };
 
@@ -227,12 +226,10 @@ function astToLatex(node: ASTNode, parentPrec = 0): string {
 
 
 
-function getBit(bits: Uint32Array, row: number): boolean {
-  return ((bits[row >>> 5] >>> (row & 31)) & 1) === 1;
-}
-
 function getAssignmentBit(row: number, varPosition: number, varCount: number): boolean {
-  return ((row >>> (varCount - 1 - varPosition)) & 1) === 1;
+  const bigRow = BigInt(row);
+  const shift = BigInt(varCount - 1 - varPosition);
+  return ((bigRow >> shift) & 1n) === 1n;
 }
 
 
@@ -263,11 +260,10 @@ export default function App() {
   const [workerData, setWorkerData] = useState<WorkerResult>({
     vars: [],
     totalRows: 0,
-    v1Bits: new Uint32Array(0),
-    v2Bits: new Uint32Array(0),
-    diffRows: new Uint32Array(0),
+    startRow: 0,
+    rows: new Uint8Array(0),
     timings: { parseMs: 0, prepMs: 0, evalMs: 0, diffMs: 0, totalMs: 0 },
-    diffCount: 0,
+    diffCount: null,
     err: null,
   });
   const [isComputing, setIsComputing] = useState(false);
@@ -282,9 +278,8 @@ export default function App() {
       setWorkerData({
         vars: evt.data.vars,
         totalRows: evt.data.totalRows,
-        v1Bits: evt.data.v1Bits,
-        v2Bits: evt.data.v2Bits,
-        diffRows: evt.data.diffRows,
+        startRow: evt.data.startRow,
+        rows: evt.data.rows,
         timings: evt.data.timings,
         diffCount: evt.data.diffCount,
         err: evt.data.err,
@@ -293,14 +288,6 @@ export default function App() {
     };
     return () => worker.terminate();
   }, []);
-
-  useEffect(() => {
-    const worker = workerRef.current;
-    if (!worker) return;
-    requestIdRef.current += 1;
-    setIsComputing(true);
-    worker.postMessage({ id: requestIdRef.current, expr1, expr2, needDiffRows: onlyDiff });
-  }, [expr1, expr2, onlyDiff]);
 
   const { latex1, latex2, latexErr, latexMs } = useMemo(() => {
     const t0 = performance.now();
@@ -320,11 +307,8 @@ export default function App() {
 
   const vars = workerData.vars;
   const totalRows = workerData.totalRows;
-  const v1Bits = workerData.v1Bits;
-  const v2Bits = workerData.v2Bits;
-  const diffRows = workerData.diffRows;
   const err = workerData.err ?? latexErr;
-  const displayCount = onlyDiff ? workerData.diffCount : totalRows;
+  const displayCount = totalRows;
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const rowVirtualizer = useVirtualizer({
@@ -337,6 +321,42 @@ export default function App() {
     () => `repeat(${vars.length + 2}, minmax(0,1fr))`,
     [vars.length]
   );
+
+  const rowPairMap = useMemo(() => {
+    const map = new Map<number, [boolean, boolean]>();
+    for (let i = 0; i < workerData.rows.length; i += 2) {
+      map.set(workerData.startRow + (i >> 1), [workerData.rows[i] === 1, workerData.rows[i + 1] === 1]);
+    }
+    return map;
+  }, [workerData.rows, workerData.startRow]);
+
+  const [windowRows, setWindowRows] = useState({ start: 0, end: 32 });
+  const lastRequestKey = useRef('');
+
+  useEffect(() => {
+    const items = rowVirtualizer.getVirtualItems();
+    if (!items.length || !totalRows) {
+      setWindowRows({ start: 0, end: 32 });
+      return;
+    }
+    const start = Math.max(0, items[0].index - 8);
+    const end = Math.min(totalRows, items[items.length - 1].index + 10);
+    setWindowRows((prev) => (prev.start === start && prev.end === end ? prev : { start, end }));
+  }, [rowVirtualizer, totalRows, displayCount]);
+
+  useEffect(() => {
+    const worker = workerRef.current;
+    if (!worker) return;
+    requestIdRef.current += 1;
+    setIsComputing(true);
+    const key = `${expr1}\u0000${expr2}\u0000${windowRows.start}\u0000${windowRows.end}`;
+    if (lastRequestKey.current === key) {
+      setIsComputing(false);
+      return;
+    }
+    lastRequestKey.current = key;
+    worker.postMessage({ id: requestIdRef.current, expr1, expr2, startRow: windowRows.start, endRow: windowRows.end, needDiffRows: onlyDiff });
+  }, [expr1, expr2, onlyDiff, windowRows.start, windowRows.end]);
 
   return (
     <main className="min-h-screen w-full bg-neutral-50 text-neutral-900 p-6 flex flex-col">
@@ -389,6 +409,7 @@ export default function App() {
               />
               <span className="text-sm">Show only differing rows</span>
             </label>
+            {onlyDiff && <span className="text-xs text-amber-700">(Disabled in ultra-large mode: rendering visible range only)</span>}
           </div>
           {err ? (
             <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-1.5">
@@ -397,7 +418,7 @@ export default function App() {
           ) : (
             <div className="text-sm text-neutral-600 text-right">
               <div>Variables: {vars.length ? vars.join(', ') : '—'}</div>
-              {!err && <div className="text-xs text-neutral-500">Worker: {workerData.timings.totalMs.toFixed(2)}ms (parse {workerData.timings.parseMs.toFixed(2)} · prep {workerData.timings.prepMs.toFixed(2)} · eval {workerData.timings.evalMs.toFixed(2)}) · Diff rows: {workerData.diffCount.toLocaleString()} · KaTeX: {latexMs.toFixed(2)}ms{isComputing ? " · computing…" : ""}</div>}
+              {!err && <div className="text-xs text-neutral-500">Worker: {workerData.timings.totalMs.toFixed(2)}ms (parse {workerData.timings.parseMs.toFixed(2)} · prep {workerData.timings.prepMs.toFixed(2)} · eval {workerData.timings.evalMs.toFixed(2)}) · Window: {windowRows.start.toLocaleString()}–{windowRows.end.toLocaleString()} · KaTeX: {latexMs.toFixed(2)}ms{isComputing ? " · computing…" : ""}</div>}
             </div>
           )}
         </section>
@@ -427,9 +448,9 @@ export default function App() {
                 }}
               >
                 {rowVirtualizer.getVirtualItems().map((item) => {
-                  const rowIndex = onlyDiff ? diffRows[item.index] : item.index;
-                  const v1 = getBit(v1Bits, rowIndex);
-                  const v2 = getBit(v2Bits, rowIndex);
+                  const rowIndex = item.index;
+                  const pair = rowPairMap.get(rowIndex) ?? [false, false];
+                  const [v1, v2] = pair;
                   const same = v1 === v2;
                   const rowClass = same ? 'bg-green-50' : 'bg-red-50';
                   return (

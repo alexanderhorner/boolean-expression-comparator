@@ -208,91 +208,122 @@ type WorkerResponse = {
   id: number;
   vars: string[];
   totalRows: number;
-  v1Bits: Uint32Array;
-  v2Bits: Uint32Array;
-  diffRows: Uint32Array;
+  startRow: number;
+  rows: Uint8Array;
   timings: { parseMs: number; prepMs: number; evalMs: number; diffMs: number; totalMs: number };
-  diffCount: number;
+  diffCount: number | null;
   err: string | null;
 };
 
-const cache = new Map<string, Omit<WorkerResponse, 'id'>>();
+type Compiled = {
+  vars: string[];
+  c1Rpn: Token[];
+  c2Rpn: Token[];
+  varIndex: Map<string, number>;
+  totalRows: number;
+};
+
+const cache = new Map<string, Compiled>();
 
 const CACHE_LIMIT = 8;
 
 
-self.onmessage = (evt: MessageEvent<WorkerRequest>) => {
-  const { id, expr1, expr2, needDiffRows } = evt.data;
-  const key = `${expr1}\u0000${expr2}\u0000${needDiffRows ? '1' : '0'}`;
+self.onmessage = (evt: MessageEvent<WorkerRequest & { startRow?: number; endRow?: number }>) => {
+  const { id, expr1, expr2 } = evt.data;
+  const startRow = Math.max(0, evt.data.startRow ?? 0);
+  const endRow = Math.max(startRow, evt.data.endRow ?? startRow);
+  const key = `${expr1}\u0000${expr2}`;
   const hit = cache.get(key);
-  if (hit) {
-    const clone: WorkerResponse = {
-      ...hit,
-      id,
-      v1Bits: hit.v1Bits.slice(),
-      v2Bits: hit.v2Bits.slice(),
-      diffRows: hit.diffRows.slice(),
-    };
-    (self as unknown as Worker).postMessage(clone, [clone.v1Bits.buffer, clone.v2Bits.buffer, clone.diffRows.buffer]);
-    return;
-  }
 
   const t0 = performance.now();
   try {
-    const c1Tokens = tokenize(expr1);
-    const c2Tokens = tokenize(expr2);
-    const c1Rpn = toRPN(c1Tokens);
-    const c2Rpn = toRPN(c2Tokens);
-    const vars = Array.from(new Set([...extractVars(c1Tokens), ...extractVars(c2Tokens)])).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    let compiled = hit;
     const t1 = performance.now();
-
-    const totalRows = Math.max(1, 2 ** vars.length);
-    const varIndex = new Map<string, number>();
-    for (let i = 0; i < vars.length; i++) varIndex.set(vars[i], i);
-    const t2 = performance.now();
-
-    const v1Bits = evalRPNBitset(c1Rpn, varIndex, vars.length, totalRows);
-    const v2Bits = evalRPNBitset(c2Rpn, varIndex, vars.length, totalRows);
-    const t3 = performance.now();
-
-    const diffBits = new Uint32Array(v1Bits.length);
-    for (let i = 0; i < diffBits.length; i++) diffBits[i] = v1Bits[i] ^ v2Bits[i];
-    let diffCount = 0;
-    for (let i = 0; i < diffBits.length; i++) diffCount += popcount32(diffBits[i]);
-    const diffRows = needDiffRows ? collectSetBitIndices(diffBits, totalRows) : new Uint32Array(0);
-    const t4 = performance.now();
-
-    const payload: Omit<WorkerResponse, 'id'> = {
-      vars,
-      totalRows,
-      v1Bits,
-      v2Bits,
-      diffRows,
-      timings: { parseMs: t1 - t0, prepMs: t2 - t1, evalMs: t3 - t2, diffMs: t4 - t3, totalMs: t4 - t0 },
-      diffCount,
-      err: null,
-    };
-
-    if (vars.length <= 22) {
+    if (!compiled) {
+      const c1Tokens = tokenize(expr1);
+      const c2Tokens = tokenize(expr2);
+      const c1Rpn = toRPN(c1Tokens);
+      const c2Rpn = toRPN(c2Tokens);
+      const vars = Array.from(new Set([...extractVars(c1Tokens), ...extractVars(c2Tokens)])).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+      const varIndex = new Map<string, number>();
+      for (let i = 0; i < vars.length; i++) varIndex.set(vars[i], i);
+      const totalRows = vars.length >= 52 ? Number.MAX_SAFE_INTEGER : Math.max(1, 2 ** vars.length);
+      compiled = { vars, c1Rpn, c2Rpn, varIndex, totalRows };
       cache.delete(key);
-      cache.set(key, payload);
+      cache.set(key, compiled);
       if (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value!);
     }
+    const t2 = performance.now();
 
-    const out: WorkerResponse = { ...payload, id };
-    (self as unknown as Worker).postMessage(out, [out.v1Bits.buffer, out.v2Bits.buffer, out.diffRows.buffer]);
+    const boundedEnd = Math.min(endRow, compiled.totalRows);
+    const len = Math.max(0, boundedEnd - startRow);
+    const rows = new Uint8Array(len * 2);
+    for (let i = 0; i < len; i++) {
+      const row = startRow + i;
+      rows[i * 2] = evalRPNAtRow(compiled.c1Rpn, compiled.varIndex, compiled.vars.length, row) ? 1 : 0;
+      rows[i * 2 + 1] = evalRPNAtRow(compiled.c2Rpn, compiled.varIndex, compiled.vars.length, row) ? 1 : 0;
+    }
+    const t3 = performance.now();
+
+    const out: WorkerResponse = {
+      id,
+      vars: compiled.vars,
+      totalRows: compiled.totalRows,
+      startRow,
+      rows,
+      timings: { parseMs: t1 - t0, prepMs: t2 - t1, evalMs: t3 - t2, diffMs: 0, totalMs: t3 - t0 },
+      diffCount: null,
+      err: null,
+    };
+    (self as unknown as Worker).postMessage(out, [out.rows.buffer]);
   } catch (e: any) {
     const out: WorkerResponse = {
       id,
       vars: [],
       totalRows: 0,
-      v1Bits: new Uint32Array(0),
-      v2Bits: new Uint32Array(0),
-      diffRows: new Uint32Array(0),
+      startRow: 0,
+      rows: new Uint8Array(0),
       timings: { parseMs: 0, prepMs: 0, evalMs: 0, diffMs: 0, totalMs: performance.now() - t0 },
-      diffCount: 0,
+      diffCount: null,
       err: e?.message ?? String(e),
     };
-    (self as unknown as Worker).postMessage(out, [out.v1Bits.buffer, out.v2Bits.buffer, out.diffRows.buffer]);
+    (self as unknown as Worker).postMessage(out, [out.rows.buffer]);
   }
 };
+
+function getAssignmentBitAtRow(row: number, varPosition: number, varCount: number): boolean {
+  const bigRow = BigInt(row);
+  const shift = BigInt(varCount - 1 - varPosition);
+  return ((bigRow >> shift) & 1n) === 1n;
+}
+
+function evalRPNAtRow(rpn: Token[], varIndex: Map<string, number>, varCount: number, row: number): boolean {
+  const stack: boolean[] = [];
+  for (const t of rpn) {
+    if (t.type === 'CONST') {
+      stack.push(t.value);
+      continue;
+    }
+    if (t.type === 'VAR') {
+      const idx = varIndex.get(t.name);
+      if (idx === undefined) throw new Error(`Unknown variable ${t.name}`);
+      stack.push(getAssignmentBitAtRow(row, idx, varCount));
+      continue;
+    }
+    if (t.type !== 'OP') continue;
+    if (t.op === 'NOT') {
+      const a = stack.pop();
+      if (a === undefined) throw new Error('NOT missing operand');
+      stack.push(!a);
+      continue;
+    }
+    const b = stack.pop();
+    const a = stack.pop();
+    if (a === undefined || b === undefined) throw new Error(`${t.op} missing operand`);
+    if (t.op === 'AND') stack.push(a && b);
+    else if (t.op === 'OR') stack.push(a || b);
+    else stack.push(a !== b);
+  }
+  if (stack.length !== 1) throw new Error('Invalid expression');
+  return stack[0];
+}
