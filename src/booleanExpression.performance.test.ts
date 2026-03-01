@@ -1,6 +1,6 @@
 import { performance } from 'node:perf_hooks';
 import { describe, expect, it } from 'vitest';
-import { allAssignments, compile, evalRPN } from './booleanExpression';
+import { bitAt, compile, evalRPN, evalRPNBatchBits } from './booleanExpression';
 
 type Timing = {
   name: string;
@@ -35,29 +35,49 @@ function measureSingleEvaluation(name: string, expression: string): Timing {
 
 function measureFullTruthTable(name: string, expression: string): Timing {
   const { rpn, vars } = compile(expression);
-  const rows = allAssignments(vars);
+  const rowCount = Math.max(1, 1 << vars.length);
 
-  const start = performance.now();
-  let trueCount = 0;
-  for (const env of rows) {
-    if (evalRPN(rpn, env)) trueCount++;
+  const env: Record<string, boolean> = {};
+  for (const v of vars) env[v] = false;
+
+  const startScalar = performance.now();
+  let trueCountScalar = 0;
+  for (let row = 0; row < rowCount; row++) {
+    for (let i = 0; i < vars.length; i++) {
+      env[vars[i]] = !!((row >> (vars.length - 1 - i)) & 1);
+    }
+    if (evalRPN(rpn, env)) trueCountScalar++;
   }
-  const elapsedMs = performance.now() - start;
+  const scalarMs = performance.now() - startScalar;
+
+  const startBatch = performance.now();
+  const { bits } = evalRPNBatchBits(rpn, vars);
+  let trueCountBatch = 0;
+  for (let row = 0; row < rowCount; row++) {
+    if (bitAt(bits, row)) trueCountBatch++;
+  }
+  const batchMs = performance.now() - startBatch;
 
   console.info('[perf] full-truth-table', {
     name,
     variables: vars.length,
-    evaluations: rows.length,
-    elapsedMs: Number(elapsedMs.toFixed(3)),
-    perEvaluationUs: Number(((elapsedMs * 1000) / rows.length).toFixed(4)),
-    trueCount,
+    evaluations: rowCount,
+    scalarMs: Number(scalarMs.toFixed(3)),
+    batchMs: Number(batchMs.toFixed(3)),
+    speedupX: Number((scalarMs / Math.max(batchMs, 0.0001)).toFixed(2)),
+    trueCountScalar,
+    trueCountBatch,
   });
+
+  if (trueCountScalar !== trueCountBatch) {
+    throw new Error(`Batch and scalar results diverged for ${name}`);
+  }
 
   return {
     name,
     variables: vars.length,
-    evaluations: rows.length,
-    elapsedMs,
+    evaluations: rowCount,
+    elapsedMs: batchMs,
   };
 }
 

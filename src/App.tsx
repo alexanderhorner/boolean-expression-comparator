@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useRef } from 'react';
 import katex from 'katex';
 import { useWindowVirtualizer } from '@tanstack/react-virtual';
-import { allAssignments, astToLatex, compile, evalRPN, type Token } from './booleanExpression';
+import { astToLatex, bitAt, compile, evalRPNBatchBits, type Token } from './booleanExpression';
 
 function asBit(b: boolean): 0 | 1 { return b ? 1 : 0; }
 
@@ -60,20 +60,26 @@ export default function App() {
 
     const valid = compiled.filter((expr): expr is CompiledExpression => expr.error === null);
     const allVars = Array.from(new Set(valid.flatMap((expr) => expr.vars))).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-    const rows = allAssignments(allVars);
+    const rowCount = Math.max(1, 1 << allVars.length);
 
-    const data = rows.map((env) => {
-      const values = compiled.map((expr) => {
+    const compiledBits = compiled.map((expr) => {
+      if (expr.error || !expr.rpn) return null;
+      const { bits } = evalRPNBatchBits(expr.rpn, allVars);
+      return bits;
+    });
+
+    const data = Array.from({ length: rowCount }, (_, rowIndex) => {
+      const values = compiled.map((expr, exprIdx) => {
         if (expr.error || !expr.rpn) {
           return { id: expr.id, ok: false as const, error: expr.error };
         }
-        return { id: expr.id, ok: true as const, value: evalRPN(expr.rpn, env) };
+        return { id: expr.id, ok: true as const, value: bitAt(compiledBits[exprIdx]!, rowIndex) };
       });
 
       const validValues = values.filter((cell): cell is { id: number; ok: true; value: boolean } => cell.ok).map((cell) => cell.value);
       const hasDiff = validValues.length > 1 && !validValues.every((value) => value === validValues[0]);
 
-      return { env, values, hasDiff };
+      return { rowIndex, values, hasDiff };
     });
 
     return { table: data, vars: allVars, compiledExpressions: compiled };
@@ -231,9 +237,10 @@ export default function App() {
                         transform: `translateY(${item.start - rowVirtualizer.options.scrollMargin}px)`,
                       }}
                     >
-                      {vars.map((v) => (
-                        <div key={v} className="px-3 py-1.5 font-mono">{asBit(row.env[v])}</div>
-                      ))}
+                      {vars.map((v, varIdx) => {
+                        const bit = (row.rowIndex >> (vars.length - 1 - varIdx)) & 1;
+                        return <div key={v} className="px-3 py-1.5 font-mono">{bit as 0 | 1}</div>;
+                      })}
                       {row.values.map((cell) => (
                         <div key={cell.id} className={`px-3 py-1.5 font-mono ${row.hasDiff ? 'text-red-700' : 'text-green-700'}`}>
                           {cell.ok ? (

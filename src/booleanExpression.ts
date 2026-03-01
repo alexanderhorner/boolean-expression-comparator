@@ -274,6 +274,80 @@ export function evalRPN(rpn: Token[], env: Record<string, boolean>): boolean {
   return st[0];
 }
 
+const variableBitsetCache = new Map<string, bigint>();
+
+function buildVariableBitset(totalRows: number, varIndex: number, varCount: number): bigint {
+  const cacheKey = `${varCount}:${varIndex}`;
+  const cached = variableBitsetCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  const period = 1 << (varCount - varIndex);
+  const highSpan = period >> 1;
+  let bits = 0n;
+
+  for (let row = 0; row < totalRows; row++) {
+    if (row % period >= highSpan) {
+      bits |= 1n << BigInt(row);
+    }
+  }
+
+  variableBitsetCache.set(cacheKey, bits);
+  return bits;
+}
+
+/**
+ * Evaluates an expression for every row of a full truth table in one pass by using bigint bit-parallel operations.
+ * Row ordering matches `allAssignments(vars)`: row 0 is all-zero, row (2^n - 1) is all-one.
+ */
+export function evalRPNBatchBits(rpn: Token[], vars: string[]): { bits: bigint; rows: number } {
+  const varCount = vars.length;
+  if (varCount >= 31) {
+    throw new Error('Batch evaluation supports at most 30 variables');
+  }
+
+  const rows = Math.max(1, 1 << varCount);
+  const mask = (1n << BigInt(rows)) - 1n;
+  const varIndex = new Map<string, number>();
+  for (let i = 0; i < vars.length; i++) varIndex.set(vars[i], i);
+
+  const st: bigint[] = [];
+
+  for (const t of rpn) {
+    if (t.type === 'CONST') {
+      st.push(t.value ? mask : 0n);
+      continue;
+    }
+
+    if (t.type === 'VAR') {
+      const idx = varIndex.get(t.name);
+      if (idx === undefined) throw new Error(`Variable '${t.name}' is undefined`);
+      st.push(buildVariableBitset(rows, idx, varCount));
+      continue;
+    }
+
+    if (t.type === 'OP') {
+      if (t.op === 'NOT') {
+        if (st.length < 1) throw new Error('NOT missing operand');
+        st.push(mask ^ st.pop()!);
+      } else {
+        if (st.length < 2) throw new Error(`${t.op} missing operand`);
+        const b = st.pop()!;
+        const a = st.pop()!;
+        if (t.op === 'AND') st.push(a & b);
+        else if (t.op === 'OR') st.push(a | b);
+        else st.push(a ^ b);
+      }
+    }
+  }
+
+  if (st.length !== 1) throw new Error('Invalid expression');
+  return { bits: st[0], rows };
+}
+
+export function bitAt(bits: bigint, row: number): boolean {
+  return ((bits >> BigInt(row)) & 1n) === 1n;
+}
+
 export function extractVars(tokens: Token[]): string[] {
   const set = new Set<string>();
   for (const t of tokens) if (t.type === 'VAR') set.add(t.name);
