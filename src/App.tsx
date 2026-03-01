@@ -267,31 +267,81 @@ function allAssignments(vars: string[]): Record<string, boolean>[] {
 
 function asBit(b: boolean): 0 | 1 { return b ? 1 : 0; }
 
+type ExpressionEntry = {
+  id: number;
+  value: string;
+};
+
+type CompiledExpression = {
+  id: number;
+  value: string;
+  vars: string[];
+  rpn: Token[];
+  latex: string;
+  error: null;
+};
+
+type InvalidExpression = {
+  id: number;
+  value: string;
+  vars: [];
+  rpn: null;
+  latex: '';
+  error: string;
+};
+
+type ExpressionResult = CompiledExpression | InvalidExpression;
+
 export default function App() {
-  const [expr1, setExpr1] = useState<string>("(A+B‘)‘");
-  const [expr2, setExpr2] = useState<string>("A‘*B");
+  const [expressions, setExpressions] = useState<ExpressionEntry[]>([
+    { id: 1, value: "(A+B‘)‘" },
+    { id: 2, value: "A‘*B" },
+  ]);
+  const [nextExprId, setNextExprId] = useState(3);
   const [onlyDiff, setOnlyDiff] = useState(false);
 
-  const { table, vars, err, latex1, latex2 } = useMemo(() => {
-    try {
-      const c1 = compile(expr1);
-      const c2 = compile(expr2);
-      const allVars = Array.from(new Set([...c1.vars, ...c2.vars])).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-      const rows = allAssignments(allVars);
-      const data = rows.map((env) => {
-        const v1 = evalRPN(c1.rpn, env);
-        const v2 = evalRPN(c2.rpn, env);
-        return { env, v1, v2, same: v1 === v2 };
-      });
-      const latex1 = katex.renderToString(astToLatex(c1.ast), { throwOnError: false });
-      const latex2 = katex.renderToString(astToLatex(c2.ast), { throwOnError: false });
-      return { table: data, vars: allVars, err: null as string | null, latex1, latex2 };
-    } catch (e: any) {
-      return { table: [] as any[], vars: [] as string[], err: e?.message ?? String(e), latex1: '', latex2: '' };
-    }
-  }, [expr1, expr2]);
+  const { table, vars, compiledExpressions } = useMemo(() => {
+    const compiled = expressions.map<ExpressionResult>((expr) => {
+      if (!expr.value.trim()) {
+        return { id: expr.id, value: expr.value, vars: [], rpn: null, latex: '', error: 'Expression is empty' };
+      }
+      try {
+        const c = compile(expr.value);
+        return {
+          id: expr.id,
+          value: expr.value,
+          vars: c.vars,
+          rpn: c.rpn,
+          latex: katex.renderToString(astToLatex(c.ast), { throwOnError: false }),
+          error: null,
+        };
+      } catch (e: any) {
+        return { id: expr.id, value: expr.value, vars: [], rpn: null, latex: '', error: e?.message ?? String(e) };
+      }
+    });
 
-  const display = useMemo(() => (onlyDiff ? table.filter((r) => !r.same) : table), [table, onlyDiff]);
+    const valid = compiled.filter((expr): expr is CompiledExpression => expr.error === null);
+    const allVars = Array.from(new Set(valid.flatMap((expr) => expr.vars))).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+    const rows = allAssignments(allVars);
+
+    const data = rows.map((env) => {
+      const values = compiled.map((expr) => {
+        if (expr.error || !expr.rpn) {
+          return { id: expr.id, ok: false as const, error: expr.error };
+        }
+        return { id: expr.id, ok: true as const, value: evalRPN(expr.rpn, env) };
+      });
+
+      const validValues = values.filter((cell): cell is { id: number; ok: true; value: boolean } => cell.ok).map((cell) => cell.value);
+      const hasDiff = validValues.length > 1 && !validValues.every((value) => value === validValues[0]);
+
+      return { env, values, hasDiff };
+    });
+
+    return { table: data, vars: allVars, compiledExpressions: compiled };
+  }, [expressions]);
+
+  const display = useMemo(() => (onlyDiff ? table.filter((r) => r.hasDiff) : table), [table, onlyDiff]);
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const rowVirtualizer = useWindowVirtualizer({
@@ -301,9 +351,22 @@ export default function App() {
     scrollMargin: listRef.current?.offsetTop ?? 0,
   });
   const gridTemplate = useMemo(
-    () => `repeat(${vars.length + 2}, minmax(0,1fr))`,
-    [vars.length]
+    () => `repeat(${vars.length + expressions.length}, minmax(0,1fr))`,
+    [vars.length, expressions.length]
   );
+
+  const updateExpression = (id: number, value: string) => {
+    setExpressions((prev) => prev.map((expr) => (expr.id === id ? { ...expr, value } : expr)));
+  };
+
+  const addExpression = () => {
+    setExpressions((prev) => [...prev, { id: nextExprId, value: '' }]);
+    setNextExprId((id) => id + 1);
+  };
+
+  const removeExpression = (id: number) => {
+    setExpressions((prev) => (prev.length <= 1 ? prev : prev.filter((expr) => expr.id !== id)));
+  };
 
   return (
     <main className="min-h-screen w-full bg-neutral-50 text-neutral-900 p-6 flex flex-col">
@@ -311,37 +374,52 @@ export default function App() {
         <header className="mb-6">
           <h1 className="text-2xl font-semibold tracking-tight">Boolean Expression Comparator</h1>
           <p className="text-sm text-neutral-600 mt-1">
-            Enter two Boolean expressions. Table highlights <span className="font-semibold text-green-700">matches</span> in green and <span className="font-semibold text-red-700">differences</span> in red.
+            Compare one or more Boolean expressions. Table highlights <span className="font-semibold text-green-700">matches</span> in green and <span className="font-semibold text-red-700">differences</span> in red.
           </p>
           <p className="text-xs text-neutral-500 mt-1">
             Syntax: OR <code className="px-1 bg-neutral-200 rounded">+</code>, AND <code className="px-1 bg-neutral-200 rounded">*</code> or adjacency, NOT postfix <code className="px-1 bg-neutral-200 rounded">A'</code> (also works with ‘ ’) or prefix <code className="px-1 bg-neutral-200 rounded">!A</code>, XOR <code className="px-1 bg-neutral-200 rounded">^</code>, constants <code className="px-1 bg-neutral-200 rounded">1</code>/<code className="px-1 bg-neutral-200 rounded">0</code>.
           </p>
         </header>
 
-        <section className="grid md:grid-cols-2 gap-4 mb-4">
-          <div className="bg-white rounded-2xl shadow-sm p-4 border border-neutral-200">
-            <label className="block text-sm font-medium mb-2">Expression 1</label>
-            <input
-              className="w-full rounded-xl border border-neutral-300 focus:outline-none focus:ring-2 focus:ring-blue-500 px-3 py-2 font-mono"
-              value={expr1}
-              onChange={(e) => setExpr1(e.target.value)}
-              placeholder="e.g., (A+B')'"
-            />
-            <div className="mt-2 min-h-[2rem] text-lg">
-              {latex1 && <span dangerouslySetInnerHTML={{ __html: latex1 }} />}
-            </div>
+        <section className="space-y-4 mb-4">
+          <div className="flex justify-between items-center">
+            <h2 className="text-sm font-medium text-neutral-700">Expressions</h2>
+            <button
+              type="button"
+              onClick={addExpression}
+              className="text-sm px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700"
+            >
+              + Add expression
+            </button>
           </div>
-          <div className="bg-white rounded-2xl shadow-sm p-4 border border-neutral-200">
-            <label className="block text-sm font-medium mb-2">Expression 2</label>
-            <input
-              className="w-full rounded-xl border border-neutral-300 focus:outline-none focus:ring-2 focus:ring-blue-500 px-3 py-2 font-mono"
-              value={expr2}
-              onChange={(e) => setExpr2(e.target.value)}
-              placeholder="e.g., A'*B"
-            />
-            <div className="mt-2 min-h-[2rem] text-lg">
-              {latex2 && <span dangerouslySetInnerHTML={{ __html: latex2 }} />}
-            </div>
+          <div className="grid md:grid-cols-2 gap-4">
+            {expressions.map((expr, index) => {
+              const compiled = compiledExpressions.find((item) => item.id === expr.id);
+              return (
+                <div key={expr.id} className="bg-white rounded-2xl shadow-sm p-4 border border-neutral-200">
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="block text-sm font-medium">Expression {index + 1}</label>
+                    <button
+                      type="button"
+                      onClick={() => removeExpression(expr.id)}
+                      disabled={expressions.length === 1}
+                      className="text-xs px-2 py-1 rounded border border-neutral-300 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-neutral-100"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                  <input
+                    className="w-full rounded-xl border border-neutral-300 focus:outline-none focus:ring-2 focus:ring-blue-500 px-3 py-2 font-mono"
+                    value={expr.value}
+                    onChange={(e) => updateExpression(expr.id, e.target.value)}
+                    placeholder="e.g., (A+B')'"
+                  />
+                  <div className="mt-2 min-h-[2rem] text-lg">
+                    {compiled?.latex && <span dangerouslySetInnerHTML={{ __html: compiled.latex }} />}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         </section>
 
@@ -357,13 +435,15 @@ export default function App() {
               <span className="text-sm">Show only differing rows</span>
             </label>
           </div>
-          {err ? (
-            <div className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-1.5">
-              Parse error: {err}
+          <div className="text-sm text-neutral-600">Variables: {vars.length ? vars.join(', ') : '—'}</div>
+        </section>
+
+        <section className="mb-3 space-y-2">
+          {compiledExpressions.filter((expr) => expr.error !== null).map((expr, idx) => (
+            <div key={expr.id} className="text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5">
+              Expression {expressions.findIndex((item) => item.id === expr.id) + 1 || idx + 1}: {expr.error}
             </div>
-          ) : (
-            <div className="text-sm text-neutral-600">Variables: {vars.length ? vars.join(', ') : '—'}</div>
-          )}
+          ))}
         </section>
 
         <div ref={listRef} className="bg-white rounded-2xl overflow-hidden shadow-sm border border-neutral-200">
@@ -375,12 +455,11 @@ export default function App() {
               {vars.map((v) => (
                 <div key={v} className="px-3 py-2 font-semibold">{v}</div>
               ))}
-              <div className="px-3 py-2 font-semibold">Expr 1</div>
-              <div className="px-3 py-2 font-semibold">Expr 2</div>
+              {expressions.map((_, idx) => (
+                <div key={idx} className="px-3 py-2 font-semibold">Expr {idx + 1}</div>
+              ))}
             </div>
-            {err ? (
-              <div className="px-3 py-4 text-neutral-500">Fix the error to see the table.</div>
-            ) : display.length === 0 ? (
+            {display.length === 0 ? (
               <div className="px-3 py-4 text-neutral-500">No rows to display.</div>
             ) : (
               <div
@@ -392,7 +471,7 @@ export default function App() {
               >
                 {rowVirtualizer.getVirtualItems().map((item) => {
                   const row = display[item.index];
-                  const rowClass = row.same ? 'bg-green-50' : 'bg-red-50';
+                  const rowClass = row.hasDiff ? 'bg-red-50' : 'bg-green-50';
                   return (
                     <div
                       key={item.key}
@@ -410,8 +489,15 @@ export default function App() {
                       {vars.map((v) => (
                         <div key={v} className="px-3 py-1.5 font-mono">{asBit(row.env[v])}</div>
                       ))}
-                      <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v1)}</div>
-                      <div className={`px-3 py-1.5 font-mono ${row.same ? 'text-green-700' : 'text-red-700'}`}>{asBit(row.v2)}</div>
+                      {row.values.map((cell) => (
+                        <div key={cell.id} className={`px-3 py-1.5 font-mono ${row.hasDiff ? 'text-red-700' : 'text-green-700'}`}>
+                          {cell.ok ? (
+                            asBit(cell.value)
+                          ) : (
+                            <span title={cell.error} className="text-amber-600">⚠️</span>
+                          )}
+                        </div>
+                      ))}
                     </div>
                   );
                 })}
