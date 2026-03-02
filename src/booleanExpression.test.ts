@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { compile, evalRPN } from './booleanExpression';
+import { bitAt, compile, evalRPN, evalRPNBatchBits } from './booleanExpression';
 
 function evaluateExpression(expression: string, env: Record<string, boolean>): boolean {
   return evalRPN(compile(expression).rpn, env);
@@ -54,6 +54,23 @@ describe('boolean expression evaluation regression coverage', () => {
     expect(evaluateExpression('A^B^C^D', { A: true, B: true, C: true, D: false })).toBe(true);
     expect(evaluateExpression('A^B^C^D', { A: true, B: true, C: true, D: true })).toBe(false);
   });
+
+  it('matches scalar and batch evaluation across full truth table', () => {
+    const expression = "((A+B')*(C+!D))^(E*F)+(G'*H)";
+    const { rpn, vars } = compile(expression);
+    const { bits } = evalRPNBatchBits(rpn, vars);
+
+    const rowCount = Math.max(1, 1 << vars.length);
+    const env: Record<string, boolean> = {};
+
+    for (let row = 0; row < rowCount; row++) {
+      for (let i = 0; i < vars.length; i++) {
+        env[vars[i]] = !!((row >> (vars.length - 1 - i)) & 1);
+      }
+      expect(bitAt(bits, row)).toBe(evalRPN(rpn, env));
+    }
+  });
+
 
   it('rejects malformed expressions (without asserting exact error text)', () => {
     expect(() => compile('(A+B')).toThrow();

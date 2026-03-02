@@ -274,6 +274,144 @@ export function evalRPN(rpn: Token[], env: Record<string, boolean>): boolean {
   return st[0];
 }
 
+const variableBitsetCache = new Map<string, Uint32Array>();
+const allOnesCache = new Map<number, Uint32Array>();
+const allZeroCache = new Map<number, Uint32Array>();
+
+function createAllOnesBits(rows: number): Uint32Array {
+  const cached = allOnesCache.get(rows);
+  if (cached) return cached;
+
+  const words = Math.ceil(rows / 32);
+  const bits = new Uint32Array(words);
+  bits.fill(0xffffffff);
+
+  const remainder = rows & 31;
+  if (remainder !== 0) {
+    bits[words - 1] = (1 << remainder) - 1;
+  }
+
+  allOnesCache.set(rows, bits);
+  return bits;
+}
+
+function createAllZeroBits(rows: number): Uint32Array {
+  const cached = allZeroCache.get(rows);
+  if (cached) return cached;
+
+  const bits = new Uint32Array(Math.ceil(rows / 32));
+  allZeroCache.set(rows, bits);
+  return bits;
+}
+
+function buildVariableBitset(totalRows: number, varIndex: number, varCount: number): Uint32Array {
+  const cacheKey = `${varCount}:${varIndex}`;
+  const cached = variableBitsetCache.get(cacheKey);
+  if (cached) return cached;
+
+  const words = Math.ceil(totalRows / 32);
+  const bits = new Uint32Array(words);
+  const period = 1 << (varCount - varIndex);
+  const highSpan = period >> 1;
+
+  for (let row = 0; row < totalRows; row++) {
+    if (row % period >= highSpan) {
+      bits[row >> 5] |= 1 << (row & 31);
+    }
+  }
+
+  variableBitsetCache.set(cacheKey, bits);
+  return bits;
+}
+
+function bitwiseBinary(a: Uint32Array, b: Uint32Array, op: 'AND' | 'OR' | 'XOR'): Uint32Array {
+  const out = new Uint32Array(a.length);
+  if (op === 'AND') {
+    for (let i = 0; i < a.length; i++) out[i] = a[i] & b[i];
+  } else if (op === 'OR') {
+    for (let i = 0; i < a.length; i++) out[i] = a[i] | b[i];
+  } else {
+    for (let i = 0; i < a.length; i++) out[i] = a[i] ^ b[i];
+  }
+  return out;
+}
+
+function bitwiseNot(a: Uint32Array, rows: number): Uint32Array {
+  const out = new Uint32Array(a.length);
+  for (let i = 0; i < a.length; i++) out[i] = ~a[i];
+
+  const remainder = rows & 31;
+  if (remainder !== 0) {
+    out[out.length - 1] &= (1 << remainder) - 1;
+  }
+
+  return out;
+}
+
+/**
+ * Evaluates an expression for every row of a full truth table in one pass with bit-parallel Uint32 operations.
+ * Row ordering matches `allAssignments(vars)`: row 0 is all-zero, row (2^n - 1) is all-one.
+ */
+export function evalRPNBatchBits(rpn: Token[], vars: string[]): { bits: Uint32Array; rows: number } {
+  const varCount = vars.length;
+  if (varCount >= 31) {
+    throw new Error('Batch evaluation supports at most 30 variables');
+  }
+
+  const rows = Math.max(1, 1 << varCount);
+  const varIndex = new Map<string, number>();
+  for (let i = 0; i < vars.length; i++) varIndex.set(vars[i], i);
+
+  const allOnes = createAllOnesBits(rows);
+  const allZero = createAllZeroBits(rows);
+  const st: Uint32Array[] = [];
+
+  for (const t of rpn) {
+    if (t.type === 'CONST') {
+      st.push(t.value ? allOnes : allZero);
+      continue;
+    }
+
+    if (t.type === 'VAR') {
+      const idx = varIndex.get(t.name);
+      if (idx === undefined) throw new Error(`Variable '${t.name}' is undefined`);
+      st.push(buildVariableBitset(rows, idx, varCount));
+      continue;
+    }
+
+    if (t.type === 'OP') {
+      if (t.op === 'NOT') {
+        if (st.length < 1) throw new Error('NOT missing operand');
+        st.push(bitwiseNot(st.pop()!, rows));
+      } else {
+        if (st.length < 2) throw new Error(`${t.op} missing operand`);
+        const b = st.pop()!;
+        const a = st.pop()!;
+        st.push(bitwiseBinary(a, b, t.op));
+      }
+    }
+  }
+
+  if (st.length !== 1) throw new Error('Invalid expression');
+  return { bits: st[0], rows };
+}
+
+export function bitAt(bits: Uint32Array, row: number): boolean {
+  return ((bits[row >> 5] >> (row & 31)) & 1) === 1;
+}
+
+function rowsToIndices(bits: Uint32Array, rows: number): number[] {
+  const out: number[] = [];
+  for (let row = 0; row < rows; row++) {
+    if (bitAt(bits, row)) out.push(row);
+  }
+  return out;
+}
+
+export function indicesFromBits(bits: Uint32Array, rows: number): number[] {
+  return rowsToIndices(bits, rows);
+}
+
 export function extractVars(tokens: Token[]): string[] {
   const set = new Set<string>();
   for (const t of tokens) if (t.type === 'VAR') set.add(t.name);
