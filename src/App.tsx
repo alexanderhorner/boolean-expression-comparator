@@ -1,7 +1,7 @@
 import React, { useState, useMemo, useRef } from 'react';
 import katex from 'katex';
 import { useWindowVirtualizer } from '@tanstack/react-virtual';
-import { astToLatex, bitAt, compile, evalRPNBatchBits, type Token } from './booleanExpression';
+import { astToLatex, bitAt, compile, evalRPNBatchBits, indicesFromBits, type Token } from './booleanExpression';
 
 function asBit(b: boolean): 0 | 1 { return b ? 1 : 0; }
 
@@ -38,7 +38,7 @@ export default function App() {
   const [nextExprId, setNextExprId] = useState(3);
   const [onlyDiff, setOnlyDiff] = useState(false);
 
-  const { table, vars, compiledExpressions } = useMemo(() => {
+  const { vars, compiledExpressions, compiledBits, rowCount, diffBits } = useMemo(() => {
     const compiled = expressions.map<ExpressionResult>((expr) => {
       if (!expr.value.trim()) {
         return { id: expr.id, value: expr.value, vars: [], rpn: null, latex: '', error: 'Expression is empty' };
@@ -60,36 +60,42 @@ export default function App() {
 
     const valid = compiled.filter((expr): expr is CompiledExpression => expr.error === null);
     const allVars = Array.from(new Set(valid.flatMap((expr) => expr.vars))).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
-    const rowCount = Math.max(1, 1 << allVars.length);
+    const rows = Math.max(1, 1 << allVars.length);
 
-    const compiledBits = compiled.map((expr) => {
+    const bits = compiled.map((expr) => {
       if (expr.error || !expr.rpn) return null;
-      const { bits } = evalRPNBatchBits(expr.rpn, allVars);
-      return bits;
+      return evalRPNBatchBits(expr.rpn, allVars).bits;
     });
 
-    const data = Array.from({ length: rowCount }, (_, rowIndex) => {
-      const values = compiled.map((expr, exprIdx) => {
-        if (expr.error || !expr.rpn) {
-          return { id: expr.id, ok: false as const, error: expr.error };
+    const validBits = bits.filter((b): b is Uint32Array => b !== null);
+    const computedDiffBits = new Uint32Array(Math.ceil(rows / 32));
+    if (validBits.length > 1) {
+      const base = validBits[0];
+      for (let i = 1; i < validBits.length; i++) {
+        const curr = validBits[i];
+        for (let w = 0; w < computedDiffBits.length; w++) {
+          computedDiffBits[w] |= base[w] ^ curr[w];
         }
-        return { id: expr.id, ok: true as const, value: bitAt(compiledBits[exprIdx]!, rowIndex) };
-      });
+      }
+    }
 
-      const validValues = values.filter((cell): cell is { id: number; ok: true; value: boolean } => cell.ok).map((cell) => cell.value);
-      const hasDiff = validValues.length > 1 && !validValues.every((value) => value === validValues[0]);
-
-      return { rowIndex, values, hasDiff };
-    });
-
-    return { table: data, vars: allVars, compiledExpressions: compiled };
+    return {
+      vars: allVars,
+      compiledExpressions: compiled,
+      compiledBits: bits,
+      rowCount: rows,
+      diffBits: computedDiffBits,
+    };
   }, [expressions]);
 
-  const display = useMemo(() => (onlyDiff ? table.filter((r) => r.hasDiff) : table), [table, onlyDiff]);
+  const displayRowIndices = useMemo(
+    () => (onlyDiff ? indicesFromBits(diffBits, rowCount) : Array.from({ length: rowCount }, (_, idx) => idx)),
+    [onlyDiff, diffBits, rowCount]
+  );
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const rowVirtualizer = useWindowVirtualizer({
-    count: display.length,
+    count: displayRowIndices.length,
     estimateSize: () => 35,
     overscan: 5,
     scrollMargin: listRef.current?.offsetTop ?? 0,
@@ -210,7 +216,7 @@ export default function App() {
                 <div key={idx} className="px-3 py-2 font-semibold">Expr {idx + 1}</div>
               ))}
             </div>
-            {display.length === 0 ? (
+            {displayRowIndices.length === 0 ? (
               <div className="px-3 py-4 text-neutral-500">No rows to display.</div>
             ) : (
               <div
@@ -221,8 +227,9 @@ export default function App() {
                 }}
               >
                 {rowVirtualizer.getVirtualItems().map((item) => {
-                  const row = display[item.index];
-                  const rowClass = row.hasDiff ? 'bg-red-50' : 'bg-green-50';
+                  const rowIndex = displayRowIndices[item.index];
+                  const rowHasDiff = bitAt(diffBits, rowIndex);
+                  const rowClass = rowHasDiff ? 'bg-red-50' : 'bg-green-50';
                   return (
                     <div
                       key={item.key}
@@ -238,15 +245,15 @@ export default function App() {
                       }}
                     >
                       {vars.map((v, varIdx) => {
-                        const bit = (row.rowIndex >> (vars.length - 1 - varIdx)) & 1;
+                        const bit = (rowIndex >> (vars.length - 1 - varIdx)) & 1;
                         return <div key={v} className="px-3 py-1.5 font-mono">{bit as 0 | 1}</div>;
                       })}
-                      {row.values.map((cell) => (
-                        <div key={cell.id} className={`px-3 py-1.5 font-mono ${row.hasDiff ? 'text-red-700' : 'text-green-700'}`}>
-                          {cell.ok ? (
-                            asBit(cell.value)
+                      {compiledExpressions.map((expr, exprIdx) => (
+                        <div key={expr.id} className={`px-3 py-1.5 font-mono ${rowHasDiff ? 'text-red-700' : 'text-green-700'}`}>
+                          {expr.error || !expr.rpn ? (
+                            <span title={expr.error} className="text-amber-600">⚠️</span>
                           ) : (
-                            <span title={cell.error} className="text-amber-600">⚠️</span>
+                            asBit(bitAt(compiledBits[exprIdx]!, rowIndex))
                           )}
                         </div>
                       ))}
